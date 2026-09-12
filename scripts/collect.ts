@@ -28,7 +28,17 @@ async function readJson<T>(file: string, fallback: T): Promise<T> {
 }
 
 const FETCH_TIMEOUT_MS = 30_000;
-const FETCH_MAX_ATTEMPTS = 3;
+const FETCH_MAX_ATTEMPTS = 2;
+const FETCH_RETRY_AFTER_CAP_MS = 10_000;
+
+// Worst-case budget: 30s timeout x 2 attempts + 0.5s backoff ~= 60.5s per
+// board. A fast 429/5xx + capped Retry-After wait is strictly cheaper
+// (~1s + <=10s + 30s ~= 41s) since one attempt cannot both time out fully
+// and carry a Retry-After wait. Boards are collected in sequential batches
+// of 8 over 153 companies (20 batches) => pathological all-timeout wall
+// clock ~= 20 x 60.5s ~= 20.2 min, leaving ~10 min of the 30-minute job
+// timeout for install/test/commit/build/deploy. Keep attempts/timeout small:
+// every extra attempt adds ~20 x timeout to the pathological total.
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -39,6 +49,18 @@ function isRetryableFetchError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return name === 'AbortError' || name === 'TimeoutError'
     || /abort|timeout|timed out|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed|network/i.test(message);
+}
+
+function retryDelayMs(response: Response): number {
+  if (response.status === 429) {
+    const header = response.headers.get('retry-after');
+    if (header) {
+      const seconds = Number(header);
+      const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header) - Date.now();
+      if (Number.isFinite(ms) && ms > 0) return Math.min(ms, FETCH_RETRY_AFTER_CAP_MS);
+    }
+  }
+  return 500;
 }
 
 async function fetchJson(url: string, init?: RequestInit, attempt = 1): Promise<unknown> {
@@ -55,14 +77,14 @@ async function fetchJson(url: string, init?: RequestInit, attempt = 1): Promise<
     });
   } catch (error) {
     if (attempt < FETCH_MAX_ATTEMPTS && isRetryableFetchError(error)) {
-      await sleep(500 * attempt);
+      await sleep(500);
       return fetchJson(url, init, attempt + 1);
     }
     throw error;
   }
   if (!response.ok) {
     if (attempt < FETCH_MAX_ATTEMPTS && (response.status === 429 || response.status >= 500)) {
-      await sleep(500 * attempt);
+      await sleep(retryDelayMs(response));
       return fetchJson(url, init, attempt + 1);
     }
     throw new Error(`HTTP ${response.status} from ${new URL(url).hostname}`);
@@ -73,6 +95,11 @@ async function fetchJson(url: string, init?: RequestInit, attempt = 1): Promise<
 const WORKDAY_PAGE_SIZE = 20;
 const WORKDAY_PAGE_LIMIT = 500;
 
+// NOTE: each Workday page goes through fetchJson with its own retry budget
+// and pages are fetched sequentially, so worst-case per-company cost scales
+// with page count. With a single Workday company this is tolerable and the
+// workflow's 30-minute job timeout is the backstop; do not add per-page
+// parallelism without revisiting the budget documented on fetchJson.
 async function fetchWorkdayBoard(host: string, tenant: string, site: string): Promise<WorkdayJob[]> {
   const url = `https://${tenant}.${host}.myworkdayjobs.com/wday/cxs/${tenant}/${site}/jobs`;
   const postings: WorkdayJob[] = [];
