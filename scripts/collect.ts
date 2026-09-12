@@ -27,17 +27,46 @@ async function readJson<T>(file: string, fallback: T): Promise<T> {
   }
 }
 
-async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetch(url, {
-    ...init,
-    headers: {
-      'user-agent': `HiringSignalRadar/1.0 (+${process.env.PUBLIC_REPOSITORY_URL || 'https://github.com'})`,
-      ...(init?.method === 'POST' ? { 'content-type': 'application/json' } : {}),
-      ...init?.headers
-    },
-    signal: AbortSignal.timeout(20_000)
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status} from ${new URL(url).hostname}`);
+const FETCH_TIMEOUT_MS = 30_000;
+const FETCH_MAX_ATTEMPTS = 3;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableFetchError(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : '';
+  const message = error instanceof Error ? error.message : String(error);
+  return name === 'AbortError' || name === 'TimeoutError'
+    || /abort|timeout|timed out|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed|network/i.test(message);
+}
+
+async function fetchJson(url: string, init?: RequestInit, attempt = 1): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: {
+        'user-agent': `HiringSignalRadar/1.0 (+${process.env.PUBLIC_REPOSITORY_URL || 'https://github.com'})`,
+        ...(init?.method === 'POST' ? { 'content-type': 'application/json' } : {}),
+        ...init?.headers
+      },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    });
+  } catch (error) {
+    if (attempt < FETCH_MAX_ATTEMPTS && isRetryableFetchError(error)) {
+      await sleep(500 * attempt);
+      return fetchJson(url, init, attempt + 1);
+    }
+    throw error;
+  }
+  if (!response.ok) {
+    if (attempt < FETCH_MAX_ATTEMPTS && (response.status === 429 || response.status >= 500)) {
+      await sleep(500 * attempt);
+      return fetchJson(url, init, attempt + 1);
+    }
+    throw new Error(`HTTP ${response.status} from ${new URL(url).hostname}`);
+  }
   return response.json();
 }
 
