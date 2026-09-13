@@ -22,8 +22,13 @@ test('expanded coverage has unique identities and generated outputs', () => {
   assert.equal(profiles.length, companies.length);
   assert.equal(profiles.filter((profile) => !Number.isInteger(profile.published7d) || !Number.isInteger(profile.publicationDelta7d) || !Number.isInteger(profile.published30d) || !Number.isFinite(profile.publicationIntensity7d)).length, 0);
   assert.equal(status.totalSources, companies.length);
-  assert.equal(status.healthySources, companies.length);
-  assert.equal(status.staleSources, 0);
+  assert.equal(status.healthySources + status.staleSources, status.totalSources);
+  assert.equal(status.healthySources + status.staleSources, companies.length);
+  // Transient board outages are expected: a source goes stale only after 2
+  // consecutive failures, and a few simultaneous transient outages must not
+  // fail the pipeline. Cap stale sources at 5 (~3% of 153) so a genuinely
+  // broken collection (provider-wide outage, parser regression) still fails.
+  assert.ok(status.staleSources <= 5, `expected at most 5 stale sources, got ${status.staleSources}`);
   assert.ok(jobs.filter((job) => job.current).length > 15_000);
   assert.equal(jobs.filter((job) => !job.level).length, 0);
   assert.equal(jobs.filter((job) => !job.category).length, 0);

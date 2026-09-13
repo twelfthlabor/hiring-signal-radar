@@ -36,17 +36,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Materialize committed snapshot
-        run: npm run materialize
-
-      - name: Test collector logic
-        run: npm test
-
       - name: Collect official job-board data and generate outputs
         env:
           PUBLIC_SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
           PUBLIC_REPOSITORY_URL: https://github.com/${{ github.repository }}
         run: npm run collect
+
+      - name: Test fresh collection
+        run: npm test
+
+      - name: Flag degraded snapshot
+        run: node -e "const fs=require('node:fs');try{const s=JSON.parse(fs.readFileSync('public/data/status.json','utf8'));if(s.staleSources>0)console.log('::warning::'+s.staleSources+' stale source(s) ('+s.healthySources+'/'+s.totalSources+' healthy) — see public/data/status.json');else console.log('All '+s.totalSources+' sources healthy.')}catch(e){console.log('::warning::Could not read public/data/status.json: '+e.message)}"
 
       - name: Commit new snapshot
         run: |
