@@ -5,7 +5,7 @@ import TrendChart from '@/components/TrendChart.astro';
 import FunctionBars from '@/components/FunctionBars.astro';
 import { companies } from '@/data/companies';
 import { buildPublicationSeries } from '@/lib/publication-history';
-import { ROLE_COLORS, ROLE_FUNCTIONS, type CollectionStatus, type CompanyProfile, type HistoryFile, type NormalizedJob } from '@/lib/types';
+import { ROLE_COLORS, ROLE_FUNCTIONS, type CollectionStatus, type CompanyProfile, type DailyCompanyPoint, type HistoryFile, type NormalizedJob } from '@/lib/types';
 import profilesRaw from '../../../public/data/companies.json';
 import jobsRaw from '../../../public/data/jobs.json';
 import statusRaw from '../../../public/data/status.json';
@@ -35,10 +35,17 @@ const functionPublicationDatasets = ROLE_FUNCTIONS.map((role) => {
 const history = historyRaw as unknown as HistoryFile;
 const companyHistory = [...(history.companies[profile.id] ?? [])].sort((left, right) => left.date.localeCompare(right.date));
 const inventoryLabels = companyHistory.map((point) => axisDate(point.date));
+// Flow bars are only attributable to a single day when the previous snapshot is the
+// day before; the first point and points after a collection gap carry multi-day flow.
+const inventoryFlow = (pick: (point: DailyCompanyPoint) => number) => companyHistory.map((point, index) => {
+  const previous = companyHistory[index - 1];
+  const consecutive = previous && Date.parse(`${point.date}T00:00:00Z`) - Date.parse(`${previous.date}T00:00:00Z`) === 86_400_000;
+  return consecutive ? pick(point) : null;
+});
 const inventoryDatasets = [
   { label: 'OPEN ROLES', data: companyHistory.map((point) => point.current), color: '#0b55d4', fill: true },
-  { label: 'OPENED', data: companyHistory.map((point) => point.opened), color: 'rgba(11,85,212,.36)', type: 'bar' as const },
-  { label: 'REMOVED', data: companyHistory.map((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
+  { label: 'OPENED · FLOW', data: inventoryFlow((point) => point.opened), color: 'rgba(11,85,212,.36)', type: 'bar' as const },
+  { label: 'REMOVED · FLOW', data: inventoryFlow((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
 ];
 const sourceUrl = profile.provider === 'greenhouse'
   ? `https://boards-api.greenhouse.io/v1/boards/${profile.boardToken}/jobs`
@@ -73,7 +80,7 @@ const companyLabel = profile.jobSeekerOnly ? 'EXPANDED EMPLOYER COVERAGE' : `${p
       <article class="profile-panel inventory-panel">
         <div class="panel-head"><div><h3 id="inventory-title">OPEN-ROLE INVENTORY</h3><p>OBSERVED OPEN POSTINGS · DAILY SNAPSHOTS</p></div><span class="section-kicker">{companyHistory.length} SNAPSHOT DAYS</span></div>
         <div data-company-inventory-chart><TrendChart labels={inventoryLabels} datasets={inventoryDatasets} rangeControls trackingSince={history.trackingSince} beginAtZero showLegend /></div>
-        <p class="history-provenance"><strong>DATA BASIS</strong> Open roles from this company's daily collection snapshots; opened and removed are observed day-over-day flow. Gaps are missed collection days, never interpolated. The first snapshot counts pre-existing inventory as opened.</p>
+        <p class="history-provenance"><strong>DATA BASIS</strong> Open roles from this company's daily collection snapshots; bars are observed flow between consecutive snapshot days. The first snapshot and days following a collection gap show no flow bar because multi-day flow cannot be attributed to a single day. Gaps are missed collection days, never interpolated.</p>
       </article>
     </section>
     <section class="company-jobs" aria-labelledby="openings-title">

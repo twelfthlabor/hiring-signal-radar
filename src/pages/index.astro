@@ -6,7 +6,8 @@ import TrendChart from '@/components/TrendChart.astro';
 import FunctionBars from '@/components/FunctionBars.astro';
 import CompanyTable from '@/components/CompanyTable.astro';
 import { buildPublicationSeries } from '@/lib/publication-history';
-import { ROLE_COLORS, ROLE_FUNCTIONS, ROLE_LEVELS, type CollectionStatus, type CompanyProfile, type DailyCompanyPoint, type HistoryFile, type MarketFile, type NormalizedJob, type RoleFunction } from '@/lib/types';
+import { aggregateInventory, type InventoryPoint } from '../lib/insights';
+import { ROLE_COLORS, ROLE_FUNCTIONS, ROLE_LEVELS, type CollectionStatus, type CompanyProfile, type HistoryFile, type MarketFile, type NormalizedJob, type RoleFunction } from '@/lib/types';
 import companiesRaw from '../../public/data/companies.json';
 import statusRaw from '../../public/data/status.json';
 import jobsRaw from '../../public/data/jobs.json';
@@ -41,22 +42,22 @@ const functionPublicationDatasets = ROLE_FUNCTIONS.map((role) => {
   return { label: role, data: publicationSeries.map((point) => rollingByDate.get(point.date) ?? 0), color: ROLE_COLORS[role] };
 });
 
-// Continuous open-role inventory from committed daily snapshots. Dates missing a snapshot for
-// more than 10% of tracked companies are dropped rather than summed into a false market dip.
+// Continuous open-role inventory from committed daily snapshots, aggregated by the
+// shared insights module so chart and detectors cannot drift.
 const history = historyRaw as unknown as HistoryFile;
-const pointsByDate = new Map<string, DailyCompanyPoint[]>();
-for (const series of Object.values(history.companies)) for (const point of series) {
-  pointsByDate.set(point.date, [...(pointsByDate.get(point.date) ?? []), point]);
-}
-const inventoryDays = [...pointsByDate.entries()]
-  .sort(([left], [right]) => left.localeCompare(right))
-  .filter(([, points]) => points.length >= Object.keys(history.companies).length * .9);
-const inventorySum = (pick: (point: DailyCompanyPoint) => number) => inventoryDays.map(([, points]) => points.reduce((total, point) => total + pick(point), 0));
-const inventoryLabels = inventoryDays.map(([date]) => axisDate(date));
+const inventoryDays = aggregateInventory(history);
+const inventoryLabels = inventoryDays.map((point) => axisDate(point.date));
+// Flow bars are only attributable to a single day when the previous snapshot is the
+// day before; the first point and points after a collection gap carry multi-day flow.
+const inventoryFlow = (pick: (point: InventoryPoint) => number) => inventoryDays.map((point, index) => {
+  const previous = inventoryDays[index - 1];
+  const consecutive = previous && Date.parse(`${point.date}T00:00:00Z`) - Date.parse(`${previous.date}T00:00:00Z`) === 86_400_000;
+  return consecutive ? pick(point) : null;
+});
 const inventoryDatasets = [
-  { label: 'OPEN ROLES', data: inventorySum((point) => point.current), color: '#0b55d4', fill: true },
-  { label: 'OPENED', data: inventorySum((point) => point.opened), color: 'rgba(11,85,212,.36)', type: 'bar' as const },
-  { label: 'REMOVED', data: inventorySum((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
+  { label: 'OPEN ROLES', data: inventoryDays.map((point) => point.current), color: '#0b55d4', fill: true },
+  { label: 'OPENED · FLOW', data: inventoryFlow((point) => point.opened), color: 'rgba(11,85,212,.36)', type: 'bar' as const },
+  { label: 'REMOVED · FLOW', data: inventoryFlow((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
 ];
 const newJobs = [...currentJobs].sort((a, b) => (b.sourcePublishedAt ?? b.firstSeen).localeCompare(a.sourcePublishedAt ?? a.firstSeen)).slice(0, 6);
 const removedJobs = jobs.filter((job) => !job.current && job.removedAt).sort((a, b) => (b.removedAt ?? '').localeCompare(a.removedAt ?? '')).slice(0, 6);
@@ -148,7 +149,7 @@ const base = import.meta.env.BASE_URL;
         <article class="chart-panel inventory-panel">
           <div class="panel-head"><div><h3 id="inventory-title">OPEN-ROLE INVENTORY — CONTINUOUS</h3><p>MARKET-WIDE OBSERVED OPEN POSTINGS · DAILY SNAPSHOTS</p></div><span class="section-kicker">{inventoryDays.length} SNAPSHOT DAYS</span></div>
           <div data-inventory-chart><TrendChart labels={inventoryLabels} datasets={inventoryDatasets} rangeControls trackingSince={history.trackingSince} beginAtZero showLegend /></div>
-          <p class="history-provenance"><strong>DATA BASIS</strong> Open roles summed from daily market snapshots; opened and removed are observed day-over-day flow. Gaps are missed collection days, never interpolated. Days reported by under 90% of tracked companies are omitted. The first snapshot counts pre-existing inventory as opened.</p>
+          <p class="history-provenance"><strong>DATA BASIS</strong> Open roles summed from daily market snapshots; bars are observed flow between consecutive snapshot days. The first snapshot and days following a collection gap show no flow bar because multi-day flow cannot be attributed to a single day. Gaps are missed collection days, never interpolated. Days reported by under 90% of tracked companies are omitted.</p>
         </article>
       </div>
       <div class="location-tape" aria-label="Top hiring countries inferred from source locations">
