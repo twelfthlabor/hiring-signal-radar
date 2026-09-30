@@ -5,10 +5,11 @@ import TrendChart from '@/components/TrendChart.astro';
 import FunctionBars from '@/components/FunctionBars.astro';
 import { companies } from '@/data/companies';
 import { buildPublicationSeries } from '@/lib/publication-history';
-import { ROLE_COLORS, ROLE_FUNCTIONS, type CollectionStatus, type CompanyProfile, type NormalizedJob } from '@/lib/types';
+import { ROLE_COLORS, ROLE_FUNCTIONS, type CollectionStatus, type CompanyProfile, type HistoryFile, type NormalizedJob } from '@/lib/types';
 import profilesRaw from '../../../public/data/companies.json';
 import jobsRaw from '../../../public/data/jobs.json';
 import statusRaw from '../../../public/data/status.json';
+import historyRaw from '../../../data/history.json';
 
 export function getStaticPaths() {
   const profiles = profilesRaw as unknown as CompanyProfile[];
@@ -21,12 +22,24 @@ const jobs = (jobsRaw as NormalizedJob[]).filter((job) => job.companyId === prof
 const currentJobs = jobs.filter((job) => job.current).sort((a, b) => b.firstSeen.localeCompare(a.firstSeen) || a.title.localeCompare(b.title));
 const status = statusRaw as CollectionStatus;
 const publicationSeries = buildPublicationSeries(jobs, status.generatedAt.slice(0, 10));
-const dateLabels = publicationSeries.map((point) => new Intl.DateTimeFormat('en-CA', { month: 'short', day: 'numeric', year: '2-digit', timeZone: 'UTC' }).format(new Date(`${point.date}T00:00:00Z`)));
+const axisFormatter = new Intl.DateTimeFormat('en-CA', { month: 'short', day: 'numeric', year: '2-digit', timeZone: 'UTC' });
+const axisDate = (date: string) => axisFormatter.format(new Date(`${date}T00:00:00Z`));
+const dateLabels = publicationSeries.map((point) => axisDate(point.date));
 const functionPublicationDatasets = ROLE_FUNCTIONS.map((role) => {
   const roleSeries = buildPublicationSeries(jobs.filter((job) => job.function === role), status.generatedAt.slice(0, 10));
   const rollingByDate = new Map(roleSeries.map((point) => [point.date, point.rolling7]));
   return { label: role, data: publicationSeries.map((point) => rollingByDate.get(point.date) ?? 0), color: ROLE_COLORS[role] };
 });
+
+// Continuous open-role inventory from this company's committed daily snapshots.
+const history = historyRaw as unknown as HistoryFile;
+const companyHistory = [...(history.companies[profile.id] ?? [])].sort((left, right) => left.date.localeCompare(right.date));
+const inventoryLabels = companyHistory.map((point) => axisDate(point.date));
+const inventoryDatasets = [
+  { label: 'OPEN ROLES', data: companyHistory.map((point) => point.current), color: '#0b55d4', fill: true },
+  { label: 'OPENED', data: companyHistory.map((point) => point.opened), color: 'rgba(11,85,212,.36)', type: 'bar' as const },
+  { label: 'REMOVED', data: companyHistory.map((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
+];
 const sourceUrl = profile.provider === 'greenhouse'
   ? `https://boards-api.greenhouse.io/v1/boards/${profile.boardToken}/jobs`
   : profile.provider === 'lever'
@@ -57,6 +70,11 @@ const companyLabel = profile.jobSeekerOnly ? 'EXPANDED EMPLOYER COVERAGE' : `${p
     <section class="profile-content">
       <article class="profile-panel"><div class="panel-head"><div><h3>FUNCTION MOMENTUM OVER TIME</h3><p>TRAILING 7-DAY PUBLICATIONS · OFFICIAL TIMESTAMPS</p></div></div><TrendChart labels={dateLabels} datasets={functionPublicationDatasets} rangeControls trackingSince={publicationSeries[0]?.date ?? status.trackingSince} beginAtZero showLegend /><p class="history-provenance"><strong>HISTORICAL BASIS</strong> Official publication dates for roles observed by this tracker. Pre-tracking removals are not represented.</p></article>
       <aside class="profile-aside"><div class="panel-head"><div><h3>FUNCTION MIX</h3><p>CURRENT OPENINGS</p></div></div><FunctionBars counts={profile.functionCounts} /></aside>
+      <article class="profile-panel inventory-panel">
+        <div class="panel-head"><div><h3 id="inventory-title">OPEN-ROLE INVENTORY</h3><p>OBSERVED OPEN POSTINGS · DAILY SNAPSHOTS</p></div><span class="section-kicker">{companyHistory.length} SNAPSHOT DAYS</span></div>
+        <div data-company-inventory-chart><TrendChart labels={inventoryLabels} datasets={inventoryDatasets} rangeControls trackingSince={history.trackingSince} beginAtZero showLegend /></div>
+        <p class="history-provenance"><strong>DATA BASIS</strong> Open roles from this company's daily collection snapshots; opened and removed are observed day-over-day flow. Gaps are missed collection days, never interpolated. The first snapshot counts pre-existing inventory as opened.</p>
+      </article>
     </section>
     <section class="company-jobs" aria-labelledby="openings-title">
       <div class="section-heading"><div><p class="section-kicker">CURRENT INVENTORY</p><h2 id="openings-title">Open roles</h2></div><div class="company-job-tools"><label class="search-field"><span class="sr-only">Search roles</span><input data-role-search type="search" placeholder="Filter role or location" /></label><a class="source-pill" href={`${base}rss/${profile.id}.xml`}>RSS FEED ↓</a></div></div>
@@ -84,6 +102,7 @@ const companyLabel = profile.jobSeekerOnly ? 'EXPANDED EMPLOYER COVERAGE' : `${p
 
 <style>
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
+  .inventory-panel { grid-column: 1 / -1; }
   .company-job-tools { display: flex; gap: 10px; align-items: center; }
   .stale-company { display: flex; align-items: center; gap: 10px; padding: 15px 20px; color: #8c2a22; border: 1px solid #c83f31; border-top: 0; font: 500 10px var(--mono); }
   @media (max-width: 650px) { .company-job-tools { align-items: stretch; flex-direction: column; margin-top: 20px; } }
