@@ -35,6 +35,10 @@ function daily(
   });
 }
 
+function dates(points: DailyCompanyPoint[]): string[] {
+  return points.map((entry) => entry.date);
+}
+
 function job(overrides: Partial<NormalizedJob> & { id: string; companyId: string; firstSeen: string }): NormalizedJob {
   return {
     sourceId: '1',
@@ -93,12 +97,27 @@ test('aggregateInventory skips dates below the company coverage threshold', () =
   assert.deepEqual(aggregateInventory(file, 1.1), []);
 });
 
-test('aggregateInventory excludes stale points and dates left without fresh coverage', () => {
+test('aggregateInventory includes stale points in sums and coverage like the charts', () => {
   const file = history({
     a: [point('2026-08-01', 5, 5), point('2026-08-02', 999, 0, 0, true)],
-    b: [point('2026-08-01', 2, 2)]
+    b: [point('2026-08-01', 2, 2), point('2026-08-02', 3, 1)]
   });
-  assert.deepEqual(aggregateInventory(file), [{ date: '2026-08-01', current: 7, opened: 7, removed: 0 }]);
+  assert.deepEqual(aggregateInventory(file), [
+    { date: '2026-08-01', current: 7, opened: 7, removed: 0 },
+    { date: '2026-08-02', current: 1002, opened: 1, removed: 0 }
+  ]);
+});
+
+test('aggregateInventory uses companies tracked by the date as its coverage denominator', () => {
+  const file = history({
+    earlyA: [point('2026-08-01', 5, 5), point('2026-08-02', 6, 1)],
+    earlyB: [point('2026-08-01', 5, 5), point('2026-08-02', 6, 1)],
+    late: [point('2026-08-03', 1, 1)]
+  });
+  const aggregate = aggregateInventory(file);
+  // `late` never counts against 08-01/08-02, and 08-03 is dropped because the early pair has no point
+  assert.deepEqual(aggregate.map((entry) => entry.date), ['2026-08-01', '2026-08-02']);
+  assert.equal(aggregate[0]?.current, 10);
 });
 
 test('derivedFunctionInventory includes firstSeen on the day and excludes removedAt on the day', () => {
@@ -165,7 +184,7 @@ test('functionMomentum compares derived inventory for all functions and sorts by
     ),
     ...Array.from({ length: 3 }, (_, index) => job({ id: `customer-${index}`, companyId: 'a', firstSeen: '2026-08-12', function: 'Customer' }))
   ];
-  const momentum = functionMomentum(jobs, '2026-08-31', 7);
+  const momentum = functionMomentum(jobs, '2026-08-31', 7, dates(daily('2026-08-01', 31, () => 10)));
   assert.equal(momentum.length, 10);
   assert.deepEqual(momentum.slice(0, 3), [
     { function: 'Sales / Marketing', current: 0, prior: 4, delta: -4 },
@@ -174,11 +193,22 @@ test('functionMomentum compares derived inventory for all functions and sorts by
   ]);
 });
 
-test('functionMomentum refuses windows that overlap the tracking-start ramp', () => {
-  const jobs = [job({ id: 'a', companyId: 'x', firstSeen: '2026-08-20' })];
+test('functionMomentum requires every calendar day between its snapshots to be observed', () => {
+  const jobs = [job({ id: 'a', companyId: 'x', firstSeen: '2026-08-01' })];
+  const observed = dates(daily('2026-08-01', 31, () => 10));
+  assert.equal(functionMomentum(jobs, '2026-08-31', 7, observed).length, 10);
+  assert.deepEqual(functionMomentum(jobs, '2026-08-31', 7, observed.filter((day) => day !== '2026-08-28')), []);
+  assert.deepEqual(functionMomentum(jobs, '2026-08-31', 7, []), []);
+  // without observed dates density cannot be certified, so it fails closed
   assert.deepEqual(functionMomentum(jobs, '2026-08-31', 7), []);
-  assert.deepEqual(functionMomentum([], '2026-08-31'), []);
-  assert.deepEqual(functionMomentum(jobs, 'not-a-day'), []);
+});
+
+test('functionMomentum refuses windows that overlap the tracking-start ramp', () => {
+  const observed = dates(daily('2026-08-01', 31, () => 10));
+  const jobs = [job({ id: 'a', companyId: 'x', firstSeen: '2026-08-20' })];
+  assert.deepEqual(functionMomentum(jobs, '2026-08-31', 7, observed), []);
+  assert.deepEqual(functionMomentum([], '2026-08-31', 7, observed), []);
+  assert.deepEqual(functionMomentum(jobs, 'not-a-day', 7, observed), []);
 });
 
 test('burst fires on a weekly opened spike relative to prior weeks', () => {
@@ -193,7 +223,7 @@ test('burst fires on a weekly opened spike relative to prior weeks', () => {
 test('burst does not fire below threshold or without 21 days of prior history', () => {
   const belowThreshold = history({ spike: daily('2026-08-01', 31, () => 50, (index) => (index >= 24 ? 1 : 1)) });
   assert.deepEqual(patterns(belowThreshold, [], '2026-08-31').filter((entry) => entry.kind === 'burst'), []);
-  // same spike, but the series only starts 19 days before the window
+  // same spike, but the series only starts 13 days before the window
   const shortHistory = history({ spike: daily('2026-08-12', 20, () => 50, (index) => (index >= 13 ? 4 : 1)) });
   assert.deepEqual(patterns(shortHistory, [], '2026-08-31').filter((entry) => entry.kind === 'burst'), []);
 });
@@ -209,7 +239,7 @@ test('churn fires when trailing gross activity is high and roughly balanced', ()
   assert.equal(found[0]?.detail, 'Opened 14 and removed 14 postings in the last 7 days (gross 28).');
 });
 
-test('churn does not fire on imbalanced, small, or baseline-only windows', () => {
+test('churn does not fire on imbalanced, small, sparse, or baseline-only windows', () => {
   const imbalanced = history({ a: daily('2026-08-01', 31, () => 50, (index) => (index >= 24 ? 10 : 0)) });
   assert.deepEqual(patterns(imbalanced, [], '2026-08-31').filter((entry) => entry.kind === 'churn'), []);
   const small = history({ a: daily('2026-08-01', 31, () => 50, (index) => (index >= 29 ? 2 : 0), (index) => (index >= 29 ? 2 : 0)) });
@@ -217,6 +247,26 @@ test('churn does not fire on imbalanced, small, or baseline-only windows', () =>
   // earliest point sits inside the trailing window: the incomplete baseline cannot produce churn
   const baseline = history({ a: daily('2026-08-28', 4, () => 50, () => 5, () => 5) });
   assert.deepEqual(patterns(baseline, [], '2026-08-31').filter((entry) => entry.kind === 'churn'), []);
+  // a 1-day hole inside the trailing window also disables churn
+  const holey = history({ a: daily('2026-08-01', 31, () => 50, () => 3, () => 3).filter((entry) => entry.date !== '2026-08-27') });
+  assert.deepEqual(patterns(holey, [], '2026-08-31').filter((entry) => entry.kind === 'churn'), []);
+});
+
+test('churn and burst stay silent through a collection hole until 7 dense days exist', () => {
+  const file = history({
+    gappy: [
+      ...daily('2026-08-01', 21, () => 50, () => 1),
+      // resumed collection lumps the missing days of opened/removed flow into 08-26
+      ...daily('2026-08-26', 7, () => 50, () => 6, () => 6)
+    ]
+  });
+  const flow = (day: string) => patterns(file, [], day).filter((entry) => entry.kind === 'churn' || entry.kind === 'burst');
+  assert.deepEqual(flow('2026-08-26'), []);
+  assert.deepEqual(flow('2026-08-27'), []);
+  assert.deepEqual(flow('2026-08-31'), []);
+  const resumed = flow('2026-09-01');
+  assert.ok(resumed.some((entry) => entry.kind === 'churn' && entry.companyId === 'gappy'));
+  assert.ok(resumed.some((entry) => entry.kind === 'burst' && entry.companyId === 'gappy'));
 });
 
 test('patterns emits market-wide expansion with companyId null and supporting numbers', () => {
@@ -255,7 +305,7 @@ test('patterns emits function-shift market-wide and per company', () => {
     ),
     job({ id: 'other-company', companyId: 'b', firstSeen: '2026-08-10', function: 'Operations' })
   ];
-  const shifts = patterns(history({ a: [], b: [] }), jobs, '2026-08-31').filter((entry) => entry.kind === 'function-shift');
+  const shifts = patterns(history({ a: daily('2026-08-01', 31, () => 50), b: daily('2026-08-01', 31, () => 50) }), jobs, '2026-08-31').filter((entry) => entry.kind === 'function-shift');
   const market = shifts.find((entry) => entry.companyId === null && entry.function === 'Sales / Marketing');
   assert.equal(market?.headline, 'Market role-mix shift');
   assert.equal(market?.detail, 'Sales / Marketing open roles -4 in 7 days (4 → 0).');
@@ -264,13 +314,28 @@ test('patterns emits function-shift market-wide and per company', () => {
   assert.equal(company?.detail, 'Engineering open roles +2 in 7 days (1 → 3).');
 });
 
-test('function-shift needs the absolute or relative threshold', () => {
-  // +1 role from a prior of 5 is 20%: below both the absolute and the relative threshold
+test('function-shift needs the absolute or relative threshold per company', () => {
+  const file = history({ x: daily('2026-08-01', 31, () => 50) });
+  // +1 role from a prior of 5 is 20%: below both the absolute and the relative company threshold
   const jobs = [
     ...Array.from({ length: 5 }, (_, index) => job({ id: `base-${index}`, companyId: 'x', firstSeen: '2026-08-10' })),
     job({ id: 'new', companyId: 'x', firstSeen: '2026-08-26' })
   ];
-  assert.deepEqual(patterns(history({ x: [] }), jobs, '2026-08-31').filter((entry) => entry.kind === 'function-shift'), []);
+  const companyShifts = patterns(file, jobs, '2026-08-31').filter((entry) => entry.kind === 'function-shift' && entry.companyId === 'x');
+  assert.deepEqual(companyShifts, []);
+});
+
+test('market-wide function-shift ignores sub-2% drift but still fires on large moves', () => {
+  const file = history({ x: daily('2026-08-01', 31, () => 50) });
+  const base = Array.from({ length: 500 }, (_, index) => job({ id: `eng-${index}`, companyId: 'x', firstSeen: '2026-08-10' }));
+  const drift = [...base, ...Array.from({ length: 9 }, (_, index) => job({ id: `drift-${index}`, companyId: 'x', firstSeen: '2026-08-26' }))];
+  const driftFound = patterns(file, drift, '2026-08-31');
+  // +9 on a 500 baseline is 1.8%: below the market threshold, but still a real company move
+  assert.deepEqual(driftFound.filter((entry) => entry.kind === 'function-shift' && entry.companyId === null), []);
+  assert.ok(driftFound.some((entry) => entry.kind === 'function-shift' && entry.companyId === 'x' && entry.function === 'Engineering'));
+  const jump = [...base, ...Array.from({ length: 30 }, (_, index) => job({ id: `jump-${index}`, companyId: 'x', firstSeen: '2026-08-26' }))];
+  const market = patterns(file, jump, '2026-08-31').find((entry) => entry.kind === 'function-shift' && entry.companyId === null && entry.function === 'Engineering');
+  assert.equal(market?.detail, 'Engineering open roles +30 in 7 days (500 → 530).');
 });
 
 test('companyPatterns restricts detectors to one company and tolerates unknown ids', () => {
@@ -285,17 +350,42 @@ test('companyPatterns restricts detectors to one company and tolerates unknown i
   assert.deepEqual(companyPatterns('missing', file, [], '2026-08-14'), []);
 });
 
-test('patterns sorts by score descending, includes market entries, and caps at 12', () => {
-  const file = history(
-    Object.fromEntries(Array.from({ length: 20 }, (_, index) => [`c${index}`, daily('2026-08-01', 14, (i) => (i < 7 ? 40 : 53))]))
-  );
-  const found = patterns(file, [], '2026-08-14');
-  assert.equal(found.length, 12);
+test('patterns caps each kind at 4, keeps score order, and leaves churn scores unclamped', () => {
+  const file = history({
+    ...Object.fromEntries(
+      Array.from({ length: 8 }, (_, index) => [
+        `churn${index}`,
+        daily('2026-08-01', 31, () => 50, (i) => (i >= 24 ? 5 + index : 0), (i) => (i >= 24 ? 5 + index : 0))
+      ])
+    ),
+    ...Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`burst${index}`, daily('2026-08-01', 31, () => 50, (i) => (i >= 24 ? 10 : 1))])),
+    ...Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`rise${index}`, daily('2026-08-01', 31, (i) => (i < 24 ? 40 : 60))]))
+  });
+  const found = patterns(file, [], '2026-08-31');
   const scores = found.map((entry) => entry.score);
   assert.deepEqual(scores, [...scores].sort((a, b) => b - a));
-  assert.equal(found[0]?.companyId, null);
+  assert.equal(found.length, 12);
+  // large gross activity is never flattened into a 100 tie
+  const churn = found.filter((entry) => entry.kind === 'churn');
+  assert.equal(churn.length, 4);
+  assert.ok(churn.every((entry) => entry.score > 100));
+  assert.equal(churn[0]?.companyId, 'churn7');
+  assert.equal(churn[0]?.detail, 'Opened 84 and removed 84 postings in the last 7 days (gross 168).');
+  assert.equal(churn[0]?.score, 336);
+  // other kinds fill the remaining slots without exceeding the cap
+  assert.ok(found.filter((entry) => entry.kind === 'burst').length <= 4);
+  assert.ok(found.filter((entry) => entry.kind === 'expansion').length <= 4);
   assert.ok(found.some((entry) => entry.companyId === null));
-  assert.ok(found.every((entry) => Number.isFinite(entry.score) && !entry.detail.includes('NaN')));
+});
+
+test('score ties break on the raw metric before companyId', () => {
+  const file = history({
+    aaa: daily('2026-08-01', 31, () => 50, (index) => (index >= 24 ? 10 : 1)),
+    zzz: daily('2026-08-01', 31, () => 50, (index) => (index >= 24 ? 12 : 1))
+  });
+  const bursts = patterns(file, [], '2026-08-31').filter((entry) => entry.kind === 'burst');
+  // both burst scores cap at 100; the larger raw opening flow ranks first despite the companyId order
+  assert.deepEqual(bursts.map((entry) => [entry.companyId, entry.score]), [['zzz', 100], ['aaa', 100]]);
 });
 
 test('detectors never throw and stay empty on empty or malformed input', () => {
@@ -322,7 +412,7 @@ test('every fired pattern describes postings with supporting numbers and no "hir
   const found = patterns(file, jobs, '2026-08-31');
   assert.ok(found.length >= 5);
   for (const entry of found) {
-    assert.ok(Number.isFinite(entry.score) && entry.score >= 0 && entry.score <= 100);
+    assert.ok(Number.isFinite(entry.score) && entry.score >= 0);
     assert.match(entry.detail, /\d/);
     assert.doesNotMatch(entry.detail + entry.headline, /hire|hiring/i);
     assert.ok(entry.detail.length > 0 && entry.headline.length > 0);

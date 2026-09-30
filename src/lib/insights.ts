@@ -7,11 +7,16 @@
  * Conventions:
  * - Dates are ISO `YYYY-MM-DD`; lexicographic order equals chronological order
  *   and all date math happens in UTC.
- * - The first collection day is an incomplete baseline: aggregate dates below
- *   `minCoverage` are dropped and the earliest observed point never counts
- *   toward churn.
- * - Insufficient history disables a detector instead of throwing; no output
- *   contains NaN.
+ * - A snapshot date is aggregated only when it covers at least `minCoverage` of
+ *   the companies tracked by that date (companies whose first point is later do
+ *   not count against it), so late config additions cannot drop old dates. The
+ *   first tracking day passes that rule and is charted; calling out its
+ *   incompleteness is a provenance/UI concern.
+ * - `opened` / `removed` are day flow. A collection gap makes the next snapshot
+ *   lump all accumulated flow, so flow detectors (burst, churn, function
+ *   momentum) require gap-free observation across the window they claim.
+ * - Insufficient history or collection gaps disable a detector instead of
+ *   throwing; no output contains NaN.
  *
  * Detector thresholds (repeated at each implementation):
  * - expansion / contraction: mean `current` of the last 7 observations vs the
@@ -19,15 +24,25 @@
  * - burst: trailing-7-day `opened` >= max(5, 2 x median weekly `opened` of the
  *   prior three weeks), with at least 21 days of points before the window.
  * - churn: trailing-7-day gross (opened + removed) >= 10 and
- *   |opened - removed| <= 25% of gross; the earliest point must precede the
- *   window. Evaluated per company: a market-wide gross would fire every period.
- * - function-shift: |delta| >= 3 roles or >= 25% relative (only when prior > 0).
+ *   |opened - removed| <= 25% of gross. Company-only: a market-wide gross would
+ *   fire every period.
+ * - function-shift: per company |delta| >= 3 roles or >= 25% relative;
+ *   market-wide (25k+ open roles) |delta| >= 25 roles or >= 2% relative, so
+ *   ordinary drift does not headline. Relative checks need prior > 0.
+ * - burst / churn require all 7 trailing calendar days to be observed snapshot
+ *   dates; function momentum requires every calendar day between its two
+ *   snapshots to be observed.
  *
- * Ranking heuristic (`score`, 0..100, higher = more notable):
+ * Ranking heuristic (`score`, higher = more notable; churn is intentionally
+ * unclamped so the largest gross activity cannot flatten into a tie):
  * - expansion / contraction: |delta| + min(50, relative %).
  * - burst: 2 x trailing opened + 10 x spike ratio (opened / prior median opened).
  * - churn: 2 x trailing gross.
  * - function-shift: |delta| + min(50, relative %).
+ * Ties break on the raw metric (|delta| / opened / gross) and then on
+ * companyId, function and kind so ordering is deterministic. `patterns` also
+ * caps each kind at 4 entries before the remaining feed slots are filled by
+ * score.
  */
 import type { DailyCompanyPoint, HistoryFile, NormalizedJob, RoleFunction } from './types';
 
@@ -38,6 +53,8 @@ const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const DETECTOR_DAYS = 7;
 /** Ranked findings returned by `patterns` / `companyPatterns`. */
 const MAX_PATTERNS = 12;
+/** `patterns` feed diversity: max entries of one kind before other kinds fill slots. */
+const MAX_PER_KIND = 4;
 /** burst: minimum trailing-7d opened. */
 const BURST_MIN_OPENED = 5;
 /** burst: days of history required before the trailing window. */
@@ -46,10 +63,14 @@ const BURST_MIN_HISTORY_DAYS = 21;
 const CHURN_MIN_GROSS = 10;
 /** churn: allowed |opened - removed| share of gross. */
 const CHURN_BALANCE = 0.25;
-/** function-shift: absolute role delta. */
+/** function-shift: absolute role delta per company. */
 const SHIFT_MIN_DELTA = 3;
-/** function-shift: relative role delta (when the prior count is positive). */
+/** function-shift: relative role delta per company (when the prior count is positive). */
 const SHIFT_MIN_RELATIVE = 0.25;
+/** function-shift: absolute role delta market-wide. */
+const MARKET_SHIFT_MIN_DELTA = 25;
+/** function-shift: relative role delta market-wide (when the prior count is positive). */
+const MARKET_SHIFT_MIN_RELATIVE = 0.02;
 
 /**
  * Canonical role-function order. Typing this as `Record<RoleFunction, true>`
@@ -101,6 +122,12 @@ export interface Pattern {
   score: number;
 }
 
+/** Internal pattern plus the raw metric used to break score ties. */
+interface Candidate {
+  pattern: Pattern;
+  magnitude: number;
+}
+
 function isoDay(value: string | undefined | null): string | null {
   if (typeof value !== 'string') return null;
   const day = value.slice(0, 10);
@@ -139,6 +166,33 @@ function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/** True when every calendar day in the inclusive [from, to] span was observed. */
+function denseEveryDay(observed: readonly string[] | undefined, from: string, to: string): boolean {
+  if (!observed || !observed.length) return false;
+  const unique = new Set<string>();
+  for (const value of observed) {
+    const date = isoDay(value);
+    if (date && date >= from && date <= to) unique.add(date);
+  }
+  const span = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / DAY_MS) + 1;
+  return Number.isFinite(span) && unique.size >= span;
+}
+
+/**
+ * True when the trailing `DETECTOR_DAYS` calendar days ending at `day` are all
+ * observed snapshot dates. Day flow (`opened` / `removed`) accumulated during a
+ * collection gap must not be presented as a 7-day window.
+ */
+function denseTrailingWindow(series: InventoryPoint[], day: string): boolean {
+  const windowStart = shiftDay(day, -(DETECTOR_DAYS - 1));
+  if (!windowStart) return false;
+  const unique = new Set<string>();
+  for (const point of series) {
+    if (point.date >= windowStart && point.date <= day) unique.add(point.date);
+  }
+  return unique.size >= DETECTOR_DAYS;
+}
+
 /**
  * Date-sorted copy of a company's snapshot series with only the inventory
  * fields. Points with an invalid date are dropped; non-finite counts become 0.
@@ -155,31 +209,37 @@ export function inventorySeries(points: DailyCompanyPoint[]): InventoryPoint[] {
 }
 
 /**
- * Market-wide sums per observed date. A date is included only when the share of
- * companies in `history` with a (fresh) point that date is >= `minCoverage`;
- * this drops partial snapshots such as the incomplete first tracking day.
- * Stale points are frozen last-known counts and are excluded from both the sums
- * and the coverage count; dates never observed are never synthesized.
+ * Market-wide sums per observed date, matching the chart policy: stale points
+ * are included (the collector keeps those jobs current) and duplicates never
+ * double count a company.
+ *
+ * Coverage: a date is included only when the companies with a point that date
+ * are at least `minCoverage` of the companies that were already tracked then
+ * (first point <= date). Late additions to the config therefore cannot
+ * retroactively drop older dates. Dates never observed are never synthesized.
  */
 export function aggregateInventory(history: HistoryFile, minCoverage = 0.9): InventoryPoint[] {
   const companies = Object.values(history?.companies ?? {});
-  const total = companies.length;
-  if (!total) return [];
+  if (!companies.length) return [];
   const coverage = typeof minCoverage === 'number' && Number.isFinite(minCoverage) ? minCoverage : 0.9;
   const byDate = new Map<string, { companies: number; current: number; opened: number; removed: number }>();
+  const firstDates: string[] = [];
 
   for (const points of companies) {
     const perCompany = new Map<string, { current: number; opened: number; removed: number }>();
+    let first: string | null = null;
     for (const point of Array.isArray(points) ? points : []) {
-      if (point?.stale) continue;
       const date = isoDay(point?.date);
       if (!date) continue;
+      if (!first || date < first) first = date;
       const bucket = perCompany.get(date) ?? { current: 0, opened: 0, removed: 0 };
       bucket.current += count(point.current);
       bucket.opened += count(point.opened);
       bucket.removed += count(point.removed);
       perCompany.set(date, bucket);
     }
+    if (!first) continue;
+    firstDates.push(first);
     for (const [date, bucket] of perCompany) {
       const target = byDate.get(date) ?? { companies: 0, current: 0, opened: 0, removed: 0 };
       target.companies += 1;
@@ -191,7 +251,10 @@ export function aggregateInventory(history: HistoryFile, minCoverage = 0.9): Inv
   }
 
   return [...byDate.entries()]
-    .filter(([, bucket]) => bucket.companies / total >= coverage)
+    .filter(([date, bucket]) => {
+      const tracked = firstDates.filter((first) => first <= date).length;
+      return tracked > 0 && bucket.companies / tracked >= coverage;
+    })
     .sort(([a], [b]) => compareStrings(a, b))
     .map(([date, bucket]) => ({ date, current: bucket.current, opened: bucket.opened, removed: bucket.removed }));
 }
@@ -206,6 +269,7 @@ export function aggregateInventory(history: HistoryFile, minCoverage = 0.9): Inv
  * recentAvg - priorAvg and the steady band is |delta| < max(3, 10% of
  * priorAvg); positive deltas at or above the band expand, negative ones contract.
  * Averages and delta are reported to 1 decimal; classification uses raw values.
+ * `current` is a stock, so gaps do not lump it the way day flow is lumped.
  */
 export function directionOf(points: InventoryPoint[], day: string, days = 7): Direction | null {
   const target = isoDay(day);
@@ -256,14 +320,26 @@ export function derivedFunctionInventory(jobs: NormalizedJob[], day: string): Pa
  * Ramp guard: returns [] unless both snapshot days are at least `days` after
  * the earliest `firstSeen` in the input, so the incomplete first tracked days
  * cannot look like real role movement.
+ *
+ * Gap guard: `observedDays` must list the snapshot dates available to the
+ * caller (e.g. the aggregate or company series dates). The comparison only runs
+ * when every calendar day in the inclusive [day - days, day] span is observed;
+ * otherwise the resumed snapshot lumps a gap of firstSeen/removedAt transitions
+ * into one fake move. Without `observedDays` density cannot be certified and []
+ * is returned, so pass the history dates whenever they exist.
  */
-export function functionMomentum(jobs: NormalizedJob[], day: string, days = 7): FunctionMomentum[] {
+export function functionMomentum(
+  jobs: NormalizedJob[],
+  day: string,
+  days = 7,
+  observedDays?: readonly string[]
+): FunctionMomentum[] {
   const target = isoDay(day);
   const window = Math.floor(days);
   if (!target || !Number.isFinite(days) || window < 1) return [];
 
   const priorDay = shiftDay(target, -window);
-  if (!priorDay) return [];
+  if (!priorDay || !denseEveryDay(observedDays, priorDay, target)) return [];
 
   let earliest: string | null = null;
   for (const job of Array.isArray(jobs) ? jobs : []) {
@@ -284,28 +360,32 @@ export function functionMomentum(jobs: NormalizedJob[], day: string, days = 7): 
 }
 
 /** expansion / contraction pattern for a `directionOf` result. */
-function directionPattern(direction: Direction, companyId: string | null): Pattern {
+function directionPattern(direction: Direction, companyId: string | null): Candidate {
   const expanding = direction.state === 'expanding';
   const magnitude = Math.abs(direction.delta);
   const relative = Math.min(50, (magnitude / Math.max(1, direction.priorAvg)) * 100);
   const sign = direction.delta > 0 ? '+' : '';
   return {
-    kind: expanding ? 'expansion' : 'contraction',
-    companyId,
-    headline: `${companyId ? '' : 'Market '}open roles ${expanding ? 'expanding' : 'contracting'}`,
-    detail: `${sign}${direction.delta} open roles in ${direction.days} days (${direction.priorAvg} → ${direction.recentAvg}).`,
-    score: Math.min(100, Math.round(magnitude + relative))
+    pattern: {
+      kind: expanding ? 'expansion' : 'contraction',
+      companyId,
+      headline: `${companyId ? '' : 'Market '}open roles ${expanding ? 'expanding' : 'contracting'}`,
+      detail: `${sign}${direction.delta} open roles in ${direction.days} days (${direction.priorAvg} → ${direction.recentAvg}).`,
+      score: Math.min(100, Math.round(magnitude + relative))
+    },
+    magnitude
   };
 }
 
 /**
  * burst: trailing-7-day `opened` >= max(5, 2 x median weekly `opened` over the
- * prior three weeks). Requires at least 21 days of points before the window and
- * at least two of the three prior weeks observed.
+ * prior three weeks). Requires at least 21 days of points before the window,
+ * at least two of the three prior weeks observed, and a gap-free trailing
+ * window (all 7 calendar days observed).
  */
-function burstPattern(series: InventoryPoint[], day: string, companyId: string): Pattern | null {
+function burstPattern(series: InventoryPoint[], day: string, companyId: string): Candidate | null {
   const windowStart = shiftDay(day, -(DETECTOR_DAYS - 1));
-  if (!windowStart) return null;
+  if (!windowStart || !denseTrailingWindow(series, day)) return null;
   const floor = shiftDay(windowStart, -BURST_MIN_HISTORY_DAYS);
   const first = series[0];
   if (!floor || !first || first.date > floor) return null;
@@ -328,23 +408,27 @@ function burstPattern(series: InventoryPoint[], day: string, companyId: string):
 
   const ratio = trailingOpened / Math.max(1, medianOpened);
   return {
-    kind: 'burst',
-    companyId,
-    headline: 'New-posting burst',
-    detail: `Opened ${trailingOpened} postings in the last 7 days vs a prior weekly median of ${medianOpened}.`,
-    score: Math.min(100, Math.round(trailingOpened * 2 + ratio * 10))
+    pattern: {
+      kind: 'burst',
+      companyId,
+      headline: 'New-posting burst',
+      detail: `Opened ${trailingOpened} postings in the last 7 days vs a prior weekly median of ${medianOpened}.`,
+      score: Math.min(100, Math.round(trailingOpened * 2 + ratio * 10))
+    },
+    magnitude: trailingOpened
   };
 }
 
 /**
  * churn: trailing-7-day gross (opened + removed) >= 10 and
  * |opened - removed| <= 25% of gross. The earliest observed point must fall
- * before the window so the incomplete baseline day cannot fake churn.
+ * before the window so the incomplete baseline day cannot fake churn, and the
+ * window must be gap-free (all 7 calendar days observed).
  */
-function churnPattern(series: InventoryPoint[], day: string, companyId: string): Pattern | null {
+function churnPattern(series: InventoryPoint[], day: string, companyId: string): Candidate | null {
   const windowStart = shiftDay(day, -(DETECTOR_DAYS - 1));
   const first = series[0];
-  if (!windowStart || !first || first.date >= windowStart) return null;
+  if (!windowStart || !first || first.date >= windowStart || !denseTrailingWindow(series, day)) return null;
 
   const window = series.filter((point) => point.date >= windowStart && point.date <= day);
   if (!window.length) return null;
@@ -354,88 +438,121 @@ function churnPattern(series: InventoryPoint[], day: string, companyId: string):
   if (gross < CHURN_MIN_GROSS || Math.abs(opened - removed) > CHURN_BALANCE * gross) return null;
 
   return {
-    kind: 'churn',
-    companyId,
-    headline: 'Posting churn',
-    detail: `Opened ${opened} and removed ${removed} postings in the last 7 days (gross ${gross}).`,
-    score: Math.min(100, gross * 2)
+    pattern: {
+      kind: 'churn',
+      companyId,
+      headline: 'Posting churn',
+      detail: `Opened ${opened} and removed ${removed} postings in the last 7 days (gross ${gross}).`,
+      score: gross * 2
+    },
+    magnitude: gross
   };
 }
 
 /**
- * function-shift: |delta| >= 3 roles or >= 25% relative (relative only when the
- * prior count is positive; a zero prior needs the absolute threshold).
+ * function-shift: per company |delta| >= 3 roles or >= 25% relative;
+ * market-wide |delta| >= 25 roles or >= 2% relative. Relative checks only apply
+ * when the prior count is positive; a zero prior needs the absolute threshold.
  */
-function functionShiftPatterns(momentum: FunctionMomentum[], companyId: string | null): Pattern[] {
-  const found: Pattern[] = [];
+function functionShiftPatterns(momentum: FunctionMomentum[], companyId: string | null): Candidate[] {
+  const minDelta = companyId === null ? MARKET_SHIFT_MIN_DELTA : SHIFT_MIN_DELTA;
+  const minRelative = companyId === null ? MARKET_SHIFT_MIN_RELATIVE : SHIFT_MIN_RELATIVE;
+  const found: Candidate[] = [];
   for (const entry of momentum) {
     const magnitude = Math.abs(entry.delta);
     const relative = entry.prior > 0 ? magnitude / entry.prior : 0;
-    if (magnitude < SHIFT_MIN_DELTA && relative < SHIFT_MIN_RELATIVE) continue;
+    if (magnitude < minDelta && relative < minRelative) continue;
     const sign = entry.delta > 0 ? '+' : '';
     found.push({
-      kind: 'function-shift',
-      companyId,
-      function: entry.function,
-      headline: `${companyId ? '' : 'Market '}role-mix shift`,
-      detail: `${entry.function} open roles ${sign}${entry.delta} in ${DETECTOR_DAYS} days (${entry.prior} → ${entry.current}).`,
-      score: Math.min(100, Math.round(magnitude + Math.min(50, relative * 100)))
+      pattern: {
+        kind: 'function-shift',
+        companyId,
+        function: entry.function,
+        headline: `${companyId ? '' : 'Market '}role-mix shift`,
+        detail: `${entry.function} open roles ${sign}${entry.delta} in ${DETECTOR_DAYS} days (${entry.prior} → ${entry.current}).`,
+        score: Math.min(100, Math.round(magnitude + Math.min(50, relative * 100)))
+      },
+      magnitude
     });
   }
   return found;
 }
 
-function rank(found: Pattern[]): Pattern[] {
-  return found
-    .sort(
-      (a, b) =>
-        b.score - a.score ||
-        compareStrings(a.companyId ?? '', b.companyId ?? '') ||
-        compareStrings(a.function ?? '', b.function ?? '') ||
-        compareStrings(a.kind, b.kind)
-    )
-    .slice(0, MAX_PATTERNS);
+/**
+ * Rank candidates by score (then raw metric, companyId, function, kind) and
+ * optionally cap each kind. Keeps the result in score order and deterministic.
+ */
+function rank(candidates: Candidate[], maxPerKind: number | null): Pattern[] {
+  const ordered = [...candidates].sort(
+    (a, b) =>
+      b.pattern.score - a.pattern.score ||
+      b.magnitude - a.magnitude ||
+      compareStrings(a.pattern.companyId ?? '', b.pattern.companyId ?? '') ||
+      compareStrings(a.pattern.function ?? '', b.pattern.function ?? '') ||
+      compareStrings(a.pattern.kind, b.pattern.kind)
+  );
+  const perKind = new Map<Pattern['kind'], number>();
+  const selected: Pattern[] = [];
+  for (const candidate of ordered) {
+    if (selected.length >= MAX_PATTERNS) break;
+    const used = perKind.get(candidate.pattern.kind) ?? 0;
+    if (maxPerKind !== null && used >= maxPerKind) continue;
+    perKind.set(candidate.pattern.kind, used + 1);
+    selected.push(candidate.pattern);
+  }
+  return selected;
 }
 
-/** Same detectors as `patterns`, restricted to one company. */
-export function companyPatterns(companyId: string, history: HistoryFile, jobs: NormalizedJob[], day: string): Pattern[] {
-  const target = isoDay(day);
-  if (!target) return [];
+/** Raw detectors for one company; `patterns` aggregates these before ranking. */
+function companyCandidates(companyId: string, history: HistoryFile, jobs: NormalizedJob[], day: string): Candidate[] {
   const series = inventorySeries(history?.companies?.[companyId] ?? []);
-  const found: Pattern[] = [];
+  const found: Candidate[] = [];
 
-  const direction = directionOf(series, target, DETECTOR_DAYS);
+  const direction = directionOf(series, day, DETECTOR_DAYS);
   if (direction && direction.state !== 'steady') found.push(directionPattern(direction, companyId));
-  const burst = burstPattern(series, target, companyId);
+  const burst = burstPattern(series, day, companyId);
   if (burst) found.push(burst);
-  const churn = churnPattern(series, target, companyId);
+  const churn = churnPattern(series, day, companyId);
   if (churn) found.push(churn);
 
   const companyJobs = Array.isArray(jobs) ? jobs.filter((job) => job?.companyId === companyId) : [];
-  if (companyJobs.length) found.push(...functionShiftPatterns(functionMomentum(companyJobs, target, DETECTOR_DAYS), companyId));
+  if (companyJobs.length) {
+    found.push(...functionShiftPatterns(functionMomentum(companyJobs, day, DETECTOR_DAYS, series.map((point) => point.date)), companyId));
+  }
+  return found;
+}
 
-  return rank(found);
+/** Same detectors as `patterns`, restricted to one company (no per-kind cap). */
+export function companyPatterns(companyId: string, history: HistoryFile, jobs: NormalizedJob[], day: string): Pattern[] {
+  const target = isoDay(day);
+  if (!target) return [];
+  return rank(companyCandidates(companyId, history, jobs, target), null);
 }
 
 /**
  * Ranked notable findings for every company in `history` plus market-wide
  * entries (`companyId: null`): expansion / contraction from `directionOf`,
  * burst and churn per company, and function-shift market-wide and per company.
- * Sorted by `score` descending, capped at 12; insufficient history means a
- * detector simply does not fire.
+ *
+ * Feed policy: sorted by `score` descending and capped at 12, with at most 4
+ * entries per kind; once a kind is capped the loop keeps filling slots with the
+ * next candidates by score (so the feed is diverse without padding). Ties use
+ * the raw metric before any id. Insufficient history, or a collection gap
+ * inside a claimed window, means a detector simply does not fire.
  */
 export function patterns(history: HistoryFile, jobs: NormalizedJob[], day: string): Pattern[] {
   const target = isoDay(day);
   if (!target) return [];
-  const found: Pattern[] = [];
+  const found: Candidate[] = [];
 
-  const marketDirection = directionOf(aggregateInventory(history), target, DETECTOR_DAYS);
+  const aggregate = aggregateInventory(history);
+  const marketDirection = directionOf(aggregate, target, DETECTOR_DAYS);
   if (marketDirection && marketDirection.state !== 'steady') found.push(directionPattern(marketDirection, null));
-  found.push(...functionShiftPatterns(functionMomentum(jobs, target, DETECTOR_DAYS), null));
+  found.push(...functionShiftPatterns(functionMomentum(jobs, target, DETECTOR_DAYS, aggregate.map((point) => point.date)), null));
 
   for (const companyId of Object.keys(history?.companies ?? {})) {
-    found.push(...companyPatterns(companyId, history, jobs, target));
+    found.push(...companyCandidates(companyId, history, jobs, target));
   }
 
-  return rank(found);
+  return rank(found, MAX_PER_KIND);
 }
