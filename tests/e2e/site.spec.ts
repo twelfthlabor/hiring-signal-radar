@@ -1,9 +1,45 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { expect, test, type Locator } from '@playwright/test';
+import { companyPatterns, patterns } from '../../src/lib/insights';
+import type { CompanyProfile, HistoryFile, NormalizedJob } from '../../src/lib/types';
 
 type ChartPayload = { labels: string[]; datasets: Array<{ label: string; data: number[] }> };
 
 const parseChartData = (wrapper: Locator): Promise<ChartPayload> =>
   wrapper.locator('.chart-data').evaluate<ChartPayload, HTMLElement>((element) => JSON.parse(element.textContent || '{}'));
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+type ExpectedPatterns = { day: string; feedCount: number; companyCount: number };
+let expectedCache: ExpectedPatterns | undefined;
+
+/**
+ * Expected pattern counts from the same committed inputs the pages build from:
+ * `data/history.json` plus `public/data/jobs.json`, scored by the real detector
+ * module at the latest history date (see `patternDay` in src/pages/index.astro
+ * and src/pages/companies/[slug].astro). Skips are gated on these counts, so a
+ * missing feed attribute is a failure, never a silent skip.
+ */
+const expectedPatterns = (): ExpectedPatterns => {
+  if (expectedCache) return expectedCache;
+  const readJson = <T>(path: string): T => JSON.parse(readFileSync(resolve(repoRoot, path), 'utf8')) as T;
+  const history = readJson<HistoryFile>('data/history.json');
+  const profiles = readJson<CompanyProfile[]>('public/data/companies.json');
+  const jobs = readJson<NormalizedJob[]>('public/data/jobs.json');
+  const investorCompanyIds = new Set(profiles.filter((profile) => !profile.jobSeekerOnly).map((profile) => profile.id));
+  const days: string[] = [];
+  for (const points of Object.values(history.companies)) for (const point of points) days.push(point.date);
+  days.sort();
+  const day = days.at(-1) ?? '';
+  expectedCache = {
+    day,
+    feedCount: day ? patterns(history, jobs.filter((job) => investorCompanyIds.has(job.companyId)), day).length : 0,
+    companyCount: day ? companyPatterns('cloudflare', history, jobs, day).length : 0
+  };
+  return expectedCache;
+};
 
 test.beforeEach(async ({ page }) => {
   const errors: string[] = [];
@@ -70,24 +106,28 @@ test('home inventory chart renders with a multi-series payload and working range
 });
 
 test('home pattern feed lists entries with numeric evidence and company links', async ({ page }) => {
+  const { day, feedCount } = expectedPatterns();
+  test.skip(feedCount === 0, `No patterns expected: patterns(history, jobs, ${day}) returned 0.`);
   await page.goto('/');
   const feed = page.locator('[data-pattern-feed]');
-  if ((await feed.count()) === 0) test.skip(true, 'Pattern feed absent: current history data yields no patterns.');
   await expect(feed).toBeVisible();
+  await expect(feed.locator('li')).toHaveCount(feedCount);
 
   const entries = await feed.locator('li').evaluateAll((items) => items.map((item) => ({
     kind: item.querySelector('.pattern-kind')?.textContent?.trim() ?? '',
     headline: item.querySelector('h3')?.textContent?.trim() ?? '',
     detail: item.querySelector('p')?.textContent?.trim() ?? ''
   })));
-  expect(entries.length).toBeGreaterThanOrEqual(1);
   expect(entries.every((entry) => entry.kind && entry.headline && entry.detail)).toBe(true);
   expect(entries.some((entry) => /\d/.test(entry.detail))).toBe(true);
 
+  // Market-wide-only feeds legitimately contain no company links.
   const companyLink = feed.locator('a.pattern-company').first();
-  await expect(companyLink).toHaveAttribute('href', /\/companies\/[^/]+\//);
-  await companyLink.click();
-  await expect(page).toHaveURL(/\/companies\/[^/]+\//);
+  if ((await companyLink.count()) > 0) {
+    await expect(companyLink).toHaveAttribute('href', /\/companies\/[^/]+\//);
+    await companyLink.click();
+    await expect(page).toHaveURL(/\/companies\/[^/]+\//);
+  }
 });
 
 test('company page renders its inventory chart', async ({ page }) => {
@@ -103,12 +143,13 @@ test('company page renders its inventory chart', async ({ page }) => {
 });
 
 test('company page lists pattern signals', async ({ page }) => {
+  const { day, companyCount } = expectedPatterns();
+  test.skip(companyCount === 0, `No company patterns expected: companyPatterns('cloudflare', history, jobs, ${day}) returned 0.`);
   await page.goto('/companies/cloudflare/');
   const block = page.locator('[data-company-patterns]');
-  if ((await block.count()) === 0) test.skip(true, 'Company pattern block absent: current history data yields no company patterns.');
   await expect(block).toBeVisible();
   const rows = block.locator('[data-pattern-feed] > li');
-  expect(await rows.count()).toBeGreaterThanOrEqual(1);
+  expect(await rows.count()).toBeGreaterThanOrEqual(companyCount);
 });
 
 test('mobile pages do not overflow horizontally', async ({ page }, testInfo) => {
