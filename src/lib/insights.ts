@@ -19,8 +19,9 @@
  *   throwing; no output contains NaN.
  *
  * Detector thresholds (repeated at each implementation):
- * - expansion / contraction: mean `current` of the last 7 observations vs the
- *   prior 7; steady when |delta| < max(3, 10% of the prior mean).
+ * - expansion / contraction: mean `current` of the last 7 calendar days vs the
+ *   prior 7; requires all 14 days ending at `day` to be observed. Steady when
+ *   |delta| < max(3, 10% of the prior mean).
  * - burst: trailing-7-day `opened` >= max(5, 2 x median weekly `opened` of the
  *   prior three weeks), with at least 21 days of points before the window.
  * - churn: trailing-7-day gross (opened + removed) >= 10 and
@@ -262,14 +263,16 @@ export function aggregateInventory(history: HistoryFile, minCoverage = 0.9): Inv
 /**
  * Direction of the `current` inventory at `day`.
  *
- * Exact rule: take the observations at or before `day` (point-count windows, so
- * sparse collection dates cannot fabricate a null). `recentAvg` is the mean of
- * the last `days` observations, `priorAvg` the mean of the `days` before those;
- * fewer than `days * 2` usable observations returns null. `delta` is
- * recentAvg - priorAvg and the steady band is |delta| < max(3, 10% of
- * priorAvg); positive deltas at or above the band expand, negative ones contract.
- * Averages and delta are reported to 1 decimal; classification uses raw values.
- * `current` is a stock, so gaps do not lump it the way day flow is lumped.
+ * Exact rule: only the `days * 2` calendar days ending at `day` are used
+ * (e.g. day-13..day for days=7) and each of them must be an observed snapshot
+ * date, otherwise null. That density requirement keeps the reported `days`
+ * honest: after a collection gap the last 14 observations could span a much
+ * longer period, so a point-count window would mislabel the span.
+ * `recentAvg` is the mean of the last `days` days, `priorAvg` the mean of the
+ * `days` before those. `delta` is recentAvg - priorAvg and the steady band is
+ * |delta| < max(3, 10% of priorAvg); positive deltas at or above the band
+ * expand, negative ones contract. Averages and delta are reported to 1 decimal;
+ * classification uses raw values.
  */
 export function directionOf(points: InventoryPoint[], day: string, days = 7): Direction | null {
   const target = isoDay(day);
@@ -283,7 +286,15 @@ export function directionOf(points: InventoryPoint[], day: string, days = 7): Di
     usable.push({ date, current: count(point.current), opened: count(point.opened), removed: count(point.removed) });
   }
   usable.sort((a, b) => compareStrings(a.date, b.date));
-  if (usable.length < window * 2) return null;
+  const required = window * 2;
+  if (usable.length < required) return null;
+
+  const spanStart = shiftDay(target, -(required - 1));
+  const recent = usable.slice(-required);
+  if (!spanStart) return null;
+  for (let index = 0; index < required; index += 1) {
+    if (recent[index]?.date !== shiftDay(spanStart, index)) return null;
+  }
 
   const recentAvg = mean(usable.slice(-window).map((point) => point.current));
   const priorAvg = mean(usable.slice(-window * 2, -window).map((point) => point.current));
@@ -380,8 +391,8 @@ function directionPattern(direction: Direction, companyId: string | null): Candi
 /**
  * burst: trailing-7-day `opened` >= max(5, 2 x median weekly `opened` over the
  * prior three weeks). Requires at least 21 days of points before the window,
- * at least two of the three prior weeks observed, and a gap-free trailing
- * window (all 7 calendar days observed).
+ * at least two of the three prior weeks fully observed (all 7 calendar days
+ * each), and a gap-free trailing window (all 7 calendar days observed).
  */
 function burstPattern(series: InventoryPoint[], day: string, companyId: string): Candidate | null {
   const windowStart = shiftDay(day, -(DETECTOR_DAYS - 1));
@@ -396,7 +407,11 @@ function burstPattern(series: InventoryPoint[], day: string, companyId: string):
     const start = end ? shiftDay(end, -(DETECTOR_DAYS - 1)) : null;
     if (!start || !end) continue;
     const observed = series.filter((point) => point.date >= start && point.date <= end);
-    if (observed.length) weekly.push(observed.reduce((sum, point) => sum + point.opened, 0));
+    // only a fully observed week is a usable baseline; a week seen on one day
+    // would deflate the median and manufacture a spike ratio
+    if (new Set(observed.map((point) => point.date)).size === DETECTOR_DAYS) {
+      weekly.push(observed.reduce((sum, point) => sum + point.opened, 0));
+    }
   }
   if (weekly.length < 2) return null;
 
