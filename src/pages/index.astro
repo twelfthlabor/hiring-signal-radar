@@ -5,12 +5,15 @@ import Freshness from '@/components/Freshness.astro';
 import TrendChart from '@/components/TrendChart.astro';
 import FunctionBars from '@/components/FunctionBars.astro';
 import CompanyTable from '@/components/CompanyTable.astro';
+import PatternFeed from '@/components/PatternFeed.astro';
 import { buildPublicationSeries } from '@/lib/publication-history';
-import { ROLE_COLORS, ROLE_FUNCTIONS, ROLE_LEVELS, type CollectionStatus, type CompanyProfile, type MarketFile, type NormalizedJob, type RoleFunction } from '@/lib/types';
+import { aggregateInventory, patterns, type InventoryPoint } from '@/lib/insights';
+import { ROLE_COLORS, ROLE_FUNCTIONS, ROLE_LEVELS, type CollectionStatus, type CompanyProfile, type HistoryFile, type MarketFile, type NormalizedJob, type RoleFunction } from '@/lib/types';
 import companiesRaw from '../../public/data/companies.json';
 import statusRaw from '../../public/data/status.json';
 import jobsRaw from '../../public/data/jobs.json';
 import marketRaw from '../../public/data/market.json';
+import historyRaw from '../../data/history.json';
 
 const allProfiles = companiesRaw as unknown as CompanyProfile[];
 const profiles = allProfiles.filter((profile) => !profile.jobSeekerOnly);
@@ -31,12 +34,35 @@ const countryCounts = Object.entries(currentJobs.reduce<Record<string, number>>(
 }, {})).sort((a, b) => b[1] - a[1]).slice(0, 8);
 
 const publicationSeries = buildPublicationSeries(jobs, today);
-const dateLabels = publicationSeries.map((point) => new Intl.DateTimeFormat('en-CA', { month: 'short', day: 'numeric', year: '2-digit', timeZone: 'UTC' }).format(new Date(`${point.date}T00:00:00Z`)));
+const axisFormatter = new Intl.DateTimeFormat('en-CA', { month: 'short', day: 'numeric', year: '2-digit', timeZone: 'UTC' });
+const axisDate = (date: string) => axisFormatter.format(new Date(`${date}T00:00:00Z`));
+const dateLabels = publicationSeries.map((point) => axisDate(point.date));
 const functionPublicationDatasets = ROLE_FUNCTIONS.map((role) => {
   const roleSeries = buildPublicationSeries(jobs.filter((job) => job.function === role), today);
   const rollingByDate = new Map(roleSeries.map((point) => [point.date, point.rolling7]));
   return { label: role, data: publicationSeries.map((point) => rollingByDate.get(point.date) ?? 0), color: ROLE_COLORS[role] };
 });
+
+// Continuous open-role inventory from committed daily snapshots, aggregated by the
+// shared insights module so chart and detectors cannot drift.
+const history = historyRaw as unknown as HistoryFile;
+const inventoryDays = aggregateInventory(history);
+const inventoryLabels = inventoryDays.map((point) => axisDate(point.date));
+// Flow bars are only attributable to a single day when the previous snapshot is the
+// day before; the first point and points after a collection gap carry multi-day flow.
+const inventoryFlow = (pick: (point: InventoryPoint) => number) => inventoryDays.map((point, index) => {
+  const previous = inventoryDays[index - 1];
+  const consecutive = previous && Date.parse(`${point.date}T00:00:00Z`) - Date.parse(`${previous.date}T00:00:00Z`) === 86_400_000;
+  return consecutive ? pick(point) : null;
+});
+const inventoryDatasets = [
+  { label: 'OPEN ROLES', data: inventoryDays.map((point) => point.current), color: '#0b55d4', fill: true },
+  { label: 'OPENED · FLOW', data: inventoryFlow((point) => point.opened), color: 'rgba(11,85,212,.36)', type: 'bar' as const },
+  { label: 'REMOVED · FLOW', data: inventoryFlow((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
+];
+// Ranked role-change findings at the latest observed history date, never the wall clock.
+const patternDay = Object.values(history.companies).flatMap((points) => points.map((point) => point.date)).sort().at(-1);
+const patternFeed = patternDay ? patterns(history, jobs, patternDay) : [];
 const newJobs = [...currentJobs].sort((a, b) => (b.sourcePublishedAt ?? b.firstSeen).localeCompare(a.sourcePublishedAt ?? a.firstSeen)).slice(0, 6);
 const removedJobs = jobs.filter((job) => !job.current && job.removedAt).sort((a, b) => (b.removedAt ?? '').localeCompare(a.removedAt ?? '')).slice(0, 6);
 const momentumLeaders = [...profiles]
@@ -123,6 +149,11 @@ const base = import.meta.env.BASE_URL;
         <article class="function-panel">
           <div class="panel-head"><div><h3>INVESTMENT THEME MIX</h3><p>CURRENT OPENINGS · RULE-BASED</p></div><span class="section-kicker">{currentJobs.length.toLocaleString()} TOTAL</span></div>
           <FunctionBars counts={functionCounts} />
+        </article>
+        <article class="chart-panel inventory-panel">
+          <div class="panel-head"><div><h3 id="inventory-title">OPEN-ROLE INVENTORY — CONTINUOUS</h3><p>MARKET-WIDE OBSERVED OPEN POSTINGS · DAILY SNAPSHOTS</p></div><span class="section-kicker">{inventoryDays.length} SNAPSHOT DAYS</span></div>
+          <div data-inventory-chart><TrendChart labels={inventoryLabels} datasets={inventoryDatasets} rangeControls trackingSince={history.trackingSince} beginAtZero showLegend /></div>
+          <p class="history-provenance"><strong>DATA BASIS</strong> Open roles summed from daily market snapshots; bars are observed flow between consecutive snapshot days. The first snapshot and days following a collection gap show no flow bar because multi-day flow cannot be attributed to a single day. Gaps are missed collection days, never interpolated. Days reported by under 90% of tracked companies are omitted.</p>
         </article>
       </div>
       <div class="location-tape" aria-label="Top hiring countries inferred from source locations">
@@ -212,6 +243,14 @@ const base = import.meta.env.BASE_URL;
       </div>
     </section>
 
+    {patternFeed.length > 0 && (
+      <section class="dashboard-section" aria-labelledby="patterns-title">
+        <div class="section-heading"><div><p class="section-kicker">06 / PATTERN FEED</p><h2 id="patterns-title">Observed role movement</h2></div><p>Rule-based findings from the daily posting snapshots, ranked by signal strength. Postings are a directional signal, not confirmed hires.</p></div>
+        <PatternFeed patterns={patternFeed} companies={allProfiles} />
+        <p class="history-provenance"><strong>PATTERN BASIS</strong> Patterns describe observed postings from daily snapshots; sparse history limits early signals.</p>
+      </section>
+    )}
+
     <section class="dashboard-section callout-section">
       <div class="jobs-note"><span>LOOKING FOR YOUR NEXT ROLE?</span><p>Explore a broader employer network by career path, freshness, level, and location.</p><a class="text-btn" href={`${base}jobs/`}>OPEN JOB SEEKER VIEW →</a></div>
     </section>
@@ -220,6 +259,7 @@ const base = import.meta.env.BASE_URL;
 
 <style>
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
+  .inventory-panel { grid-column: 1 / -1; border-right: 0; border-top: 1px solid var(--line-strong); }
   .structure-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; border: 1px solid var(--line-strong); background: var(--line-strong); }
   .structure-strip > div { padding: 14px 18px; background: var(--paper); }
   .structure-strip strong { display: block; font: 500 30px/1 var(--display); letter-spacing: -.03em; }

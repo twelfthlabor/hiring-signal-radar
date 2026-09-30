@@ -1,0 +1,60 @@
+---
+import type { Pattern } from '@/lib/insights';
+import type { CompanyProfile } from '@/lib/types';
+
+interface Props {
+  patterns: Pattern[];
+  companies?: CompanyProfile[];
+  compact?: boolean;
+}
+const { patterns, companies = [], compact = false } = Astro.props;
+const names = new Map(companies.map((company) => [company.id, company.name]));
+const base = import.meta.env.BASE_URL;
+---
+
+<ol class:list={['pattern-feed', { compact }]} data-pattern-feed>
+  {patterns.map((pattern, index) => (
+    <li class:list={['pattern', `k-${pattern.kind}`]}>
+      <span class="pattern-rank">{String(index + 1).padStart(2, '0')}</span>
+      <span class="pattern-kind">{pattern.kind.replace('-', ' ')}</span>
+      <div class="pattern-body">
+        <h3>{pattern.headline}</h3>
+        <p>{pattern.detail}</p>
+      </div>
+      {companies.length > 0 && (
+        pattern.companyId
+          ? names.has(pattern.companyId)
+            ? <a class="pattern-company" href={`${base}companies/${pattern.companyId}/`}>{names.get(pattern.companyId)} →</a>
+            : <span class="pattern-company is-muted">{pattern.companyId}</span>
+          : <span class="pattern-company is-muted">MARKET</span>
+      )}
+    </li>
+  ))}
+</ol>
+
+<style>
+  .pattern-feed { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line-strong); background: rgba(255,255,255,.2); }
+  .pattern { display: grid; grid-template-columns: 34px max-content minmax(0, 1fr) auto; align-items: center; gap: 16px; min-height: 72px; padding: 14px 22px; border-bottom: 1px solid var(--line); }
+  .pattern:last-child { border-bottom: 0; }
+  .pattern:hover { background: var(--white); }
+  .pattern-rank { color: var(--ink-soft); font: 500 9px var(--mono); }
+  .pattern-kind { padding: 4px 7px; color: var(--kind, var(--ink)); border: 1px solid color-mix(in srgb, var(--kind, var(--ink)) 40%, transparent); background: color-mix(in srgb, var(--kind, var(--ink)) 8%, transparent); font: 600 7px var(--mono); letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+  .k-expansion { --kind: var(--blue); }
+  .k-contraction { --kind: var(--red); }
+  .k-burst { --kind: var(--orange); }
+  .k-churn { --kind: #7a4ce0; }
+  .k-function-shift { --kind: #178149; }
+  .pattern-body h3 { margin: 0; font-size: 12px; }
+  .pattern-body h3::first-letter { text-transform: uppercase; }
+  .pattern-body p { margin: 4px 0 0; color: var(--ink-soft); font: 400 9px/1.5 var(--mono); }
+  .pattern-company { color: var(--blue); font: 600 8px var(--mono); letter-spacing: .04em; border-bottom: 1px solid currentColor; }
+  .pattern-company.is-muted { color: var(--ink-soft); border-bottom: 0; }
+  .compact .pattern { gap: 12px; min-height: 0; padding: 12px 16px; }
+  .compact .pattern-body h3 { font-size: 11px; }
+  @media (max-width: 650px) {
+    .pattern { grid-template-columns: 27px minmax(0, 1fr); }
+    .pattern-kind, .pattern-body, .pattern-company { grid-column: 2; }
+    .pattern-kind { justify-self: start; }
+    .pattern-company { justify-self: start; }
+  }
+</style>
