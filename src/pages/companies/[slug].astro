@@ -3,8 +3,10 @@ import Layout from '@/layouts/Layout.astro';
 import Metric from '@/components/Metric.astro';
 import TrendChart from '@/components/TrendChart.astro';
 import FunctionBars from '@/components/FunctionBars.astro';
+import PatternFeed from '@/components/PatternFeed.astro';
 import { companies } from '@/data/companies';
 import { buildPublicationSeries } from '@/lib/publication-history';
+import { companyPatterns } from '@/lib/insights';
 import { ROLE_COLORS, ROLE_FUNCTIONS, type CollectionStatus, type CompanyProfile, type HistoryFile, type NormalizedJob } from '@/lib/types';
 import profilesRaw from '../../../public/data/companies.json';
 import jobsRaw from '../../../public/data/jobs.json';
@@ -40,6 +42,12 @@ const inventoryDatasets = [
   { label: 'OPENED', data: companyHistory.map((point) => point.opened), color: 'rgba(11,85,212,.36)', type: 'bar' as const },
   { label: 'REMOVED', data: companyHistory.map((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
 ];
+// Compact signal block at the latest observed history date, never the wall clock.
+const historyDays: string[] = [];
+for (const points of Object.values(history.companies)) for (const point of points) historyDays.push(point.date);
+historyDays.sort();
+const patternDay = historyDays.at(-1);
+const companySignals = patternDay ? companyPatterns(profile.id, history, jobs, patternDay) : [];
 const sourceUrl = profile.provider === 'greenhouse'
   ? `https://boards-api.greenhouse.io/v1/boards/${profile.boardToken}/jobs`
   : profile.provider === 'lever'
@@ -75,6 +83,12 @@ const companyLabel = profile.jobSeekerOnly ? 'EXPANDED EMPLOYER COVERAGE' : `${p
         <div data-company-inventory-chart><TrendChart labels={inventoryLabels} datasets={inventoryDatasets} rangeControls trackingSince={history.trackingSince} beginAtZero showLegend /></div>
         <p class="history-provenance"><strong>DATA BASIS</strong> Open roles from this company's daily collection snapshots; opened and removed are observed day-over-day flow. Gaps are missed collection days, never interpolated. The first snapshot counts pre-existing inventory as opened.</p>
       </article>
+      {companySignals.length > 0 && (
+        <article class="profile-panel pattern-panel" data-company-patterns>
+          <div class="panel-head"><div><h3>PATTERN SIGNALS</h3><p>RULE-BASED · OBSERVED DAILY SNAPSHOTS</p></div><span class="section-kicker">{companySignals.length} RANKED SIGNALS</span></div>
+          <PatternFeed patterns={companySignals} compact />
+        </article>
+      )}
     </section>
     <section class="company-jobs" aria-labelledby="openings-title">
       <div class="section-heading"><div><p class="section-kicker">CURRENT INVENTORY</p><h2 id="openings-title">Open roles</h2></div><div class="company-job-tools"><label class="search-field"><span class="sr-only">Search roles</span><input data-role-search type="search" placeholder="Filter role or location" /></label><a class="source-pill" href={`${base}rss/${profile.id}.xml`}>RSS FEED ↓</a></div></div>
@@ -103,6 +117,7 @@ const companyLabel = profile.jobSeekerOnly ? 'EXPANDED EMPLOYER COVERAGE' : `${p
 <style>
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
   .inventory-panel { grid-column: 1 / -1; }
+  .pattern-panel { grid-column: 1 / -1; }
   .company-job-tools { display: flex; gap: 10px; align-items: center; }
   .stale-company { display: flex; align-items: center; gap: 10px; padding: 15px 20px; color: #8c2a22; border: 1px solid #c83f31; border-top: 0; font: 500 10px var(--mono); }
   @media (max-width: 650px) { .company-job-tools { align-items: stretch; flex-direction: column; margin-top: 20px; } }

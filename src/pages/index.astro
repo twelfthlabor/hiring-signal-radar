@@ -5,7 +5,9 @@ import Freshness from '@/components/Freshness.astro';
 import TrendChart from '@/components/TrendChart.astro';
 import FunctionBars from '@/components/FunctionBars.astro';
 import CompanyTable from '@/components/CompanyTable.astro';
+import PatternFeed from '@/components/PatternFeed.astro';
 import { buildPublicationSeries } from '@/lib/publication-history';
+import { patterns } from '@/lib/insights';
 import { ROLE_COLORS, ROLE_FUNCTIONS, ROLE_LEVELS, type CollectionStatus, type CompanyProfile, type DailyCompanyPoint, type HistoryFile, type MarketFile, type NormalizedJob, type RoleFunction } from '@/lib/types';
 import companiesRaw from '../../public/data/companies.json';
 import statusRaw from '../../public/data/status.json';
@@ -58,6 +60,9 @@ const inventoryDatasets = [
   { label: 'OPENED', data: inventorySum((point) => point.opened), color: 'rgba(11,85,212,.36)', type: 'bar' as const },
   { label: 'REMOVED', data: inventorySum((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
 ];
+// Ranked role-change findings at the latest observed history date, never the wall clock.
+const patternDay = [...pointsByDate.keys()].sort((left, right) => left.localeCompare(right)).at(-1);
+const patternFeed = patternDay ? patterns(history, jobs, patternDay) : [];
 const newJobs = [...currentJobs].sort((a, b) => (b.sourcePublishedAt ?? b.firstSeen).localeCompare(a.sourcePublishedAt ?? a.firstSeen)).slice(0, 6);
 const removedJobs = jobs.filter((job) => !job.current && job.removedAt).sort((a, b) => (b.removedAt ?? '').localeCompare(a.removedAt ?? '')).slice(0, 6);
 const momentumLeaders = [...profiles]
@@ -237,6 +242,14 @@ const base = import.meta.env.BASE_URL;
         </article>
       </div>
     </section>
+
+    {patternFeed.length > 0 && (
+      <section class="dashboard-section" aria-labelledby="patterns-title">
+        <div class="section-heading"><div><p class="section-kicker">06 / PATTERN FEED</p><h2 id="patterns-title">Observed role movement</h2></div><p>Rule-based findings from the daily posting snapshots, ranked by signal strength. Postings are a directional signal, not confirmed hires.</p></div>
+        <PatternFeed patterns={patternFeed} companies={allProfiles} />
+        <p class="history-provenance"><strong>PATTERN BASIS</strong> Patterns describe observed postings from daily snapshots; sparse history limits early signals.</p>
+      </section>
+    )}
 
     <section class="dashboard-section callout-section">
       <div class="jobs-note"><span>LOOKING FOR YOUR NEXT ROLE?</span><p>Explore a broader employer network by career path, freshness, level, and location.</p><a class="text-btn" href={`${base}jobs/`}>OPEN JOB SEEKER VIEW →</a></div>
