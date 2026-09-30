@@ -30,9 +30,10 @@
  * - function-shift: per company |delta| >= 3 roles or >= 25% relative;
  *   market-wide (25k+ open roles) |delta| >= 25 roles or >= 2% relative, so
  *   ordinary drift does not headline. Relative checks need prior > 0.
- * - burst / churn require all 7 trailing calendar days to be observed snapshot
- *   dates; function momentum requires every calendar day between its two
- *   snapshots to be observed.
+ * - burst / churn require 8 consecutive observed snapshot dates ending at `day`
+ *   (the 7-day window plus the day before it), so the first resumed collection
+ *   after a gap cannot present its accumulated lump as a 7-day flow; function
+ *   momentum requires every calendar day between its two snapshots observed.
  *
  * Ranking heuristic (`score`, higher = more notable; churn is intentionally
  * unclamped so the largest gross activity cannot flatten into a tie):
@@ -180,18 +181,22 @@ function denseEveryDay(observed: readonly string[] | undefined, from: string, to
 }
 
 /**
- * True when the trailing `DETECTOR_DAYS` calendar days ending at `day` are all
- * observed snapshot dates. Day flow (`opened` / `removed`) accumulated during a
- * collection gap must not be presented as a 7-day window.
+ * True when the 8 calendar dates ending at `day` are all observed: the trailing
+ * `DETECTOR_DAYS`-day window plus the day immediately before it. Day flow
+ * (`opened` / `removed`) accumulated during a collection gap lands on the first
+ * resumed snapshot, so a window that starts on that snapshot must not be
+ * presented as 7 days of flow; requiring the observed predecessor keeps the
+ * claim honest.
  */
 function denseTrailingWindow(series: InventoryPoint[], day: string): boolean {
   const windowStart = shiftDay(day, -(DETECTOR_DAYS - 1));
-  if (!windowStart) return false;
+  const predecessor = windowStart ? shiftDay(windowStart, -1) : null;
+  if (!windowStart || !predecessor) return false;
   const unique = new Set<string>();
   for (const point of series) {
-    if (point.date >= windowStart && point.date <= day) unique.add(point.date);
+    if (point.date >= predecessor && point.date <= day) unique.add(point.date);
   }
-  return unique.size >= DETECTOR_DAYS;
+  return unique.size >= DETECTOR_DAYS + 1;
 }
 
 /**
@@ -392,7 +397,8 @@ function directionPattern(direction: Direction, companyId: string | null): Candi
  * burst: trailing-7-day `opened` >= max(5, 2 x median weekly `opened` over the
  * prior three weeks). Requires at least 21 days of points before the window,
  * at least two of the three prior weeks fully observed (all 7 calendar days
- * each), and a gap-free trailing window (all 7 calendar days observed).
+ * each), and 8 consecutive observed dates ending at `day` (the trailing window
+ * plus its predecessor).
  */
 function burstPattern(series: InventoryPoint[], day: string, companyId: string): Candidate | null {
   const windowStart = shiftDay(day, -(DETECTOR_DAYS - 1));
@@ -437,8 +443,10 @@ function burstPattern(series: InventoryPoint[], day: string, companyId: string):
 /**
  * churn: trailing-7-day gross (opened + removed) >= 10 and
  * |opened - removed| <= 25% of gross. The earliest observed point must fall
- * before the window so the incomplete baseline day cannot fake churn, and the
- * window must be gap-free (all 7 calendar days observed).
+ * before the window so the incomplete baseline day cannot fake churn, and all
+ * 8 dates ending at `day` must be observed (the window plus its predecessor):
+ * a window starting on the first resumed snapshot after a gap would otherwise
+ * count the accumulated lump as 7 days of flow.
  */
 function churnPattern(series: InventoryPoint[], day: string, companyId: string): Candidate | null {
   const windowStart = shiftDay(day, -(DETECTOR_DAYS - 1));

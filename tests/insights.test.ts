@@ -240,10 +240,11 @@ test('burst ignores prior weeks that were observed on only one day', () => {
       ...daily('2026-08-05', 1, () => 50, () => 1),
       ...daily('2026-08-12', 1, () => 50, () => 1),
       ...daily('2026-08-19', 1, () => 50, () => 1),
+      ...daily('2026-08-25', 1, () => 50, () => 1),
       ...daily('2026-08-26', 7, () => 50, () => 6)
     ]
   });
-  // single observed days per prior week would deflate the median and fake a spike
+  // prior weeks observed on only one or two days would deflate the median and fake a spike
   assert.deepEqual(patterns(holey, [], '2026-09-01').filter((entry) => entry.kind === 'burst'), []);
   const observedWeeks = history({
     spike: [...daily('2026-08-05', 21, () => 50, () => 1), ...daily('2026-08-26', 7, () => 50, () => 6)]
@@ -277,21 +278,42 @@ test('churn does not fire on imbalanced, small, sparse, or baseline-only windows
   assert.deepEqual(patterns(holey, [], '2026-08-31').filter((entry) => entry.kind === 'churn'), []);
 });
 
-test('churn and burst stay silent through a collection hole until 7 dense days exist', () => {
-  const file = history({
-    gappy: [
-      ...daily('2026-08-01', 21, () => 50, () => 1),
-      // resumed collection lumps the missing days of opened/removed flow into 08-26
-      ...daily('2026-08-26', 7, () => 50, () => 6, () => 6)
-    ]
-  });
-  const flow = (day: string) => patterns(file, [], day).filter((entry) => entry.kind === 'churn' || entry.kind === 'burst');
-  assert.deepEqual(flow('2026-08-26'), []);
-  assert.deepEqual(flow('2026-08-27'), []);
-  assert.deepEqual(flow('2026-08-31'), []);
-  const resumed = flow('2026-09-01');
+test('churn and burst stay silent through a collection hole until 8 consecutive dates exist', () => {
+  const gappy = (resumedDays: number) =>
+    history({
+      gappy: [
+        ...daily('2026-08-01', 21, () => 50, () => 1),
+        // resumed collection lumps the missing days of opened/removed flow into 08-26
+        ...daily('2026-08-26', resumedDays, () => 50, () => 6, () => 6)
+      ]
+    });
+  const flow = (days: number, day: string) =>
+    patterns(gappy(days), [], day).filter((entry) => entry.kind === 'churn' || entry.kind === 'burst');
+  assert.deepEqual(flow(7, '2026-08-26'), []);
+  assert.deepEqual(flow(7, '2026-08-27'), []);
+  assert.deepEqual(flow(7, '2026-08-31'), []);
+  // 7 window days, but the predecessor 08-25 was inside the hole: still not a 7-day claim
+  assert.deepEqual(flow(7, '2026-09-01'), []);
+  const resumed = flow(8, '2026-09-02');
   assert.ok(resumed.some((entry) => entry.kind === 'churn' && entry.companyId === 'gappy'));
   assert.ok(resumed.some((entry) => entry.kind === 'burst' && entry.companyId === 'gappy'));
+});
+
+test('churn demands an observed predecessor so a resume lump is not a 7-day claim', () => {
+  const resumed = (normalDays: number) =>
+    history({
+      gappy: [
+        ...daily('2026-08-01', 5, () => 50, () => 1),
+        point('2026-09-30', 50, 96, 102), // R: 19 outage days of flow lumped into one snapshot
+        ...daily('2026-10-01', normalDays, () => 50, () => 1, () => 1)
+      ]
+    });
+  const flow = (days: number, day: string) =>
+    patterns(resumed(days), [], day).filter((entry) => entry.kind === 'churn' || entry.kind === 'burst');
+  // R+6: window R..R+6 is 7 distinct dates, but 09-29 was never observed
+  assert.deepEqual(flow(6, '2026-10-06'), []);
+  // R+7: window 10-01..10-07 now has R as its observed predecessor
+  assert.ok(flow(7, '2026-10-07').some((entry) => entry.kind === 'churn' && entry.companyId === 'gappy'));
 });
 
 test('patterns emits market-wide expansion with companyId null and supporting numbers', () => {
