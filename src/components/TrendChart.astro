@@ -1,5 +1,5 @@
 ---
-interface Dataset { label: string; data: number[]; color?: string; fill?: boolean; }
+interface Dataset { label: string; data: number[]; color?: string; fill?: boolean; type?: 'line' | 'bar'; }
 interface Props { labels: string[]; datasets: Dataset[]; rangeControls?: boolean; trackingSince?: string; beginAtZero?: boolean; showLegend?: boolean; }
 const { labels, datasets, rangeControls = false, trackingSince, beginAtZero = false, showLegend = false } = Astro.props;
 const chartData = JSON.stringify({ labels, datasets, beginAtZero, showLegend }).replace(/</g, '\\u003c');
@@ -31,18 +31,31 @@ const chartData = JSON.stringify({ labels, datasets, beginAtZero, showLegend }).
       type: 'line',
       data: {
         labels: payload.labels,
-        datasets: payload.datasets.map((dataset: { label: string; data: number[]; color?: string; fill?: boolean }, index: number) => ({
-          label: dataset.label,
-          data: dataset.data,
-          borderColor: dataset.color || (index ? '#f25b2a' : '#0b55d4'),
-          backgroundColor: dataset.fill ? 'rgba(11,85,212,.09)' : 'transparent',
-          fill: Boolean(dataset.fill),
-          borderWidth: 2,
-          pointRadius: payload.labels.length < 3 ? 4 : 0,
-          pointHoverRadius: 5,
-          pointBackgroundColor: dataset.color || '#0b55d4',
-          tension: .28
-        }))
+        datasets: payload.datasets.map((dataset: { label: string; data: number[]; color?: string; fill?: boolean; type?: 'line' | 'bar' }, index: number) => {
+          const color = dataset.color || (index ? '#f25b2a' : '#0b55d4');
+          if (dataset.type === 'bar') return {
+            type: 'bar' as const,
+            label: dataset.label,
+            data: dataset.data,
+            backgroundColor: color,
+            borderWidth: 0,
+            borderRadius: 2,
+            maxBarThickness: 8,
+            order: 1
+          };
+          return {
+            label: dataset.label,
+            data: dataset.data,
+            borderColor: color,
+            backgroundColor: dataset.fill ? 'rgba(11,85,212,.09)' : 'transparent',
+            fill: Boolean(dataset.fill),
+            borderWidth: 2,
+            pointRadius: payload.labels.length < 3 ? 4 : 0,
+            pointHoverRadius: 5,
+            pointBackgroundColor: dataset.color || '#0b55d4',
+            tension: .28
+          };
+        })
       },
       options: {
         maintainAspectRatio: false,
