@@ -61,7 +61,7 @@ const inventoryDatasets = [
   { label: 'REMOVED · FLOW', data: inventoryFlow((point) => point.removed), color: 'rgba(242,91,42,.42)', type: 'bar' as const }
 ];
 // Ranked role-change findings at the latest observed history date, never the wall clock.
-const patternDay = [...pointsByDate.keys()].sort((left, right) => left.localeCompare(right)).at(-1);
+const patternDay = Object.values(history.companies).flatMap((points) => points.map((point) => point.date)).sort().at(-1);
 const patternFeed = patternDay ? patterns(history, jobs, patternDay) : [];
 const newJobs = [...currentJobs].sort((a, b) => (b.sourcePublishedAt ?? b.firstSeen).localeCompare(a.sourcePublishedAt ?? a.firstSeen)).slice(0, 6);
 const removedJobs = jobs.filter((job) => !job.current && job.removedAt).sort((a, b) => (b.removedAt ?? '').localeCompare(a.removedAt ?? '')).slice(0, 6);
