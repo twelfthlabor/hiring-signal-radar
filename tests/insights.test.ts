@@ -163,15 +163,21 @@ test('directionOf keeps small moves inside the documented steady band', () => {
   assert.equal(floorBand?.state, 'expanding');
 });
 
-test('directionOf uses point windows so sparse dates and future points cannot distort it', () => {
-  const sparse: DailyCompanyPoint[] = [];
-  for (let index = 0; index < 14; index += 1) {
-    sparse.push(point(new Date(Date.UTC(2026, 7, 1 + index * 2)).toISOString().slice(0, 10), index < 7 ? 10 : 25));
-  }
-  const series = inventorySeries(sparse);
-  const direction = directionOf([...series, point('2026-09-30', 999)], '2026-08-27');
-  assert.equal(direction?.state, 'expanding');
-  assert.equal(direction?.delta, 15);
+test('directionOf requires the last days*2 observations to be consecutive calendar days', () => {
+  // 14 observations, but the trailing span is 44 calendar days
+  const sparse = [
+    ...daily('2026-08-19', 7, () => 40),
+    ...daily('2026-09-06', 5, () => 53),
+    ...daily('2026-09-30', 2, () => 53)
+  ];
+  assert.equal(directionOf(inventorySeries(sparse), '2026-10-01'), null);
+  // the same shape over 14 consecutive days is a real 7-day move
+  const dense = inventorySeries([...daily('2026-09-18', 7, () => 40), ...daily('2026-09-25', 7, () => 53)]);
+  const expected = { state: 'expanding', delta: 13, recentAvg: 53, priorAvg: 40, days: 7 };
+  assert.deepEqual(directionOf(dense, '2026-10-01'), expected);
+  // future points and older observations do not disturb the required 14-day span
+  assert.deepEqual(directionOf([...dense, point('2026-10-31', 999)], '2026-10-01'), expected);
+  assert.deepEqual(directionOf([point('2026-08-01', 5), ...dense], '2026-10-01'), expected);
 });
 
 test('functionMomentum compares derived inventory for all functions and sorts by |delta|', () => {
@@ -226,6 +232,25 @@ test('burst does not fire below threshold or without 21 days of prior history', 
   // same spike, but the series only starts 13 days before the window
   const shortHistory = history({ spike: daily('2026-08-12', 20, () => 50, (index) => (index >= 13 ? 4 : 1)) });
   assert.deepEqual(patterns(shortHistory, [], '2026-08-31').filter((entry) => entry.kind === 'burst'), []);
+});
+
+test('burst ignores prior weeks that were observed on only one day', () => {
+  const holey = history({
+    holey: [
+      ...daily('2026-08-05', 1, () => 50, () => 1),
+      ...daily('2026-08-12', 1, () => 50, () => 1),
+      ...daily('2026-08-19', 1, () => 50, () => 1),
+      ...daily('2026-08-26', 7, () => 50, () => 6)
+    ]
+  });
+  // single observed days per prior week would deflate the median and fake a spike
+  assert.deepEqual(patterns(holey, [], '2026-09-01').filter((entry) => entry.kind === 'burst'), []);
+  const observedWeeks = history({
+    spike: [...daily('2026-08-05', 21, () => 50, () => 1), ...daily('2026-08-26', 7, () => 50, () => 6)]
+  });
+  const bursts = patterns(observedWeeks, [], '2026-09-01').filter((entry) => entry.kind === 'burst');
+  assert.equal(bursts.length, 1);
+  assert.equal(bursts[0]?.companyId, 'spike');
 });
 
 test('churn fires when trailing gross activity is high and roughly balanced', () => {
