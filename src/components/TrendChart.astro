@@ -1,5 +1,5 @@
 ---
-interface Dataset { label: string; data: number[]; color?: string; fill?: boolean; type?: 'line' | 'bar'; }
+interface Dataset { label: string; data: (number | null)[]; color?: string; fill?: boolean; type?: 'line' | 'bar'; }
 interface Props { labels: string[]; datasets: Dataset[]; rangeControls?: boolean; trackingSince?: string; beginAtZero?: boolean; showLegend?: boolean; }
 const { labels, datasets, rangeControls = false, trackingSince, beginAtZero = false, showLegend = false } = Astro.props;
 const chartData = JSON.stringify({ labels, datasets, beginAtZero, showLegend }).replace(/</g, '\\u003c');
@@ -26,15 +26,25 @@ const chartData = JSON.stringify({ labels, datasets, beginAtZero, showLegend }).
     const dataElement = root.querySelector<HTMLScriptElement>('.chart-data');
     if (!canvas || !dataElement) return;
     const payload = JSON.parse(dataElement.textContent || '{}');
-    const fullData = payload.datasets.map((dataset: { data: number[] }) => [...dataset.data]);
+    const hasFlowAxis = payload.datasets.some((dataset: { type?: string }) => dataset.type === 'bar');
+    const fullData = payload.datasets.map((dataset: { data: (number | null)[] }) => [...dataset.data]);
+    const flowScale = {
+      position: 'right' as const,
+      beginAtZero: true,
+      grid: { display: false },
+      border: { display: false },
+      ticks: { color: '#58647a', precision: 0, font: { family: 'IBM Plex Mono', size: 9 } },
+      title: { display: true, text: 'DAILY FLOW · RIGHT', color: '#58647a', font: { family: 'IBM Plex Mono', size: 9 } }
+    };
     const chart = new Chart(canvas, {
       type: 'line',
       data: {
         labels: payload.labels,
-        datasets: payload.datasets.map((dataset: { label: string; data: number[]; color?: string; fill?: boolean; type?: 'line' | 'bar' }, index: number) => {
+        datasets: payload.datasets.map((dataset: { label: string; data: (number | null)[]; color?: string; fill?: boolean; type?: 'line' | 'bar' }, index: number) => {
           const color = dataset.color || (index ? '#f25b2a' : '#0b55d4');
           if (dataset.type === 'bar') return {
             type: 'bar' as const,
+            yAxisID: 'flow',
             label: dataset.label,
             data: dataset.data,
             backgroundColor: color,
@@ -61,6 +71,7 @@ const chartData = JSON.stringify({ labels, datasets, beginAtZero, showLegend }).
         maintainAspectRatio: false,
         responsive: true,
         interaction: { intersect: false, mode: 'index' },
+        layout: hasFlowAxis ? { padding: { left: 8, right: 8 } } : undefined,
         plugins: {
           legend: {
             display: Boolean(payload.showLegend),
@@ -86,10 +97,21 @@ const chartData = JSON.stringify({ labels, datasets, beginAtZero, showLegend }).
         },
         scales: {
           x: { grid: { display: false }, ticks: { color: '#58647a', font: { family: 'IBM Plex Mono', size: 9 }, maxTicksLimit: 7 } },
-          y: { beginAtZero: Boolean(payload.beginAtZero), grid: { color: 'rgba(10,29,61,.1)' }, ticks: { color: '#58647a', precision: 0, font: { family: 'IBM Plex Mono', size: 9 } }, border: { display: false } }
+          y: {
+            beginAtZero: Boolean(payload.beginAtZero),
+            grid: { color: 'rgba(10,29,61,.1)' },
+            ticks: { color: '#58647a', precision: 0, font: { family: 'IBM Plex Mono', size: 9 } },
+            border: { display: false },
+            title: hasFlowAxis ? { display: true, text: 'OPEN ROLES · LEFT', color: '#58647a', font: { family: 'IBM Plex Mono', size: 9 } } : undefined
+          },
+          ...(hasFlowAxis ? { flow: flowScale } : {})
         }
       }
     });
+
+    // Tick labels can be measured before the webfont loads, which leaves the
+    // widest label clipped at the canvas edge; re-fit once fonts are ready.
+    if (hasFlowAxis && document.fonts) document.fonts.ready.then(() => chart.update('none'));
 
     const shell = root.closest<HTMLElement>('[data-chart-shell]');
     const setRange = (button: HTMLButtonElement) => {
