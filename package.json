@@ -18,13 +18,13 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@astrojs/check": "^0.9.10",
+    "@astrojs/check": "^0.9.12",
     "@fontsource-variable/archivo": "^5.3.0",
     "@fontsource-variable/newsreader": "^5.3.0",
     "@fontsource/ibm-plex-mono": "^5.3.0",
-    "astro": "^7.2.0",
-    "chart.js": "^4.5.0",
-    "typescript": "^5.9.2"
+    "astro": "^7.4.2",
+    "chart.js": "^4.6.1",
+    "typescript": "^7.0.2"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
